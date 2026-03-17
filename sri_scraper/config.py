@@ -15,6 +15,7 @@ class SRIConfig(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        env_ignore_empty=True,  # Empty env vars treated as unset (use defaults)
     )
 
     # ── Credenciales ──────────────────────────────────────────────────────────
