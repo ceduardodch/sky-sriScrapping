@@ -185,59 +185,61 @@ def start_scheduler() -> None:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     from apscheduler.triggers.cron import CronTrigger
 
-    scheduler = AsyncIOScheduler(timezone="America/Guayaquil")
+    async def _main() -> None:
+        scheduler = AsyncIOScheduler(timezone="America/Guayaquil")
 
-    async def schedule_tenants() -> None:
-        """Reagenda jobs al inicio y cada 6 horas para detectar nuevos tenants."""
-        from .database import AsyncSessionLocal
-        from .models import Tenant
-        from sqlalchemy import select
+        async def schedule_tenants() -> None:
+            """Reagenda jobs al inicio y cada 6 horas para detectar nuevos tenants."""
+            from .database import AsyncSessionLocal
+            from .models import Tenant
+            from sqlalchemy import select
 
-        async with AsyncSessionLocal() as session:
-            tenants = (await session.execute(
-                select(Tenant).where(Tenant.active.is_(True)).order_by(Tenant.id)
-            )).scalars().all()
+            async with AsyncSessionLocal() as session:
+                tenants = (await session.execute(
+                    select(Tenant).where(Tenant.active.is_(True)).order_by(Tenant.id)
+                )).scalars().all()
 
-        # Limpiar jobs anteriores de scraping
-        for job in scheduler.get_jobs():
-            if job.id.startswith("scrape_"):
-                job.remove()
+            # Limpiar jobs anteriores de scraping
+            for job in scheduler.get_jobs():
+                if job.id.startswith("scrape_"):
+                    job.remove()
 
-        for i, tenant in enumerate(tenants):
-            hour = 1
-            minute = i * 20
-            if minute >= 60:
-                hour += minute // 60
-                minute = minute % 60
+            for i, tenant in enumerate(tenants):
+                hour = 1
+                minute = i * 20
+                if minute >= 60:
+                    hour += minute // 60
+                    minute = minute % 60
 
-            async def _run(tid=tenant.id):
-                from .database import AsyncSessionLocal
-                from .models import ScrapeLog
-                async with AsyncSessionLocal() as session:
-                    scrape_log = ScrapeLog(tenant_id=tid, status="running")
-                    session.add(scrape_log)
-                    await session.commit()
-                    await session.refresh(scrape_log)
-                    log_id = scrape_log.id
-                await run_scrape_for_tenant(tid, log_id)
+                async def _run(tid=tenant.id):
+                    from .database import AsyncSessionLocal
+                    from .models import ScrapeLog
+                    async with AsyncSessionLocal() as session:
+                        scrape_log = ScrapeLog(tenant_id=tid, status="running")
+                        session.add(scrape_log)
+                        await session.commit()
+                        await session.refresh(scrape_log)
+                        log_id = scrape_log.id
+                    await run_scrape_for_tenant(tid, log_id)
 
-            scheduler.add_job(
-                _run,
-                CronTrigger(hour=hour, minute=minute),
-                id=f"scrape_{tenant.id}",
-                replace_existing=True,
-            )
-            log.info("job_scheduled", tenant_id=tenant.id, at=f"{hour:02d}:{minute:02d}")
+                scheduler.add_job(
+                    _run,
+                    CronTrigger(hour=hour, minute=minute),
+                    id=f"scrape_{tenant.id}",
+                    replace_existing=True,
+                )
+                log.info("job_scheduled", tenant_id=tenant.id, at=f"{hour:02d}:{minute:02d}")
 
-    # Reagendar tenants al inicio y cada 6 horas
-    scheduler.add_job(schedule_tenants, "interval", hours=6, id="reschedule", next_run_time=datetime.now())
-    scheduler.start()
+        # Reagendar tenants al inicio y cada 6 horas
+        scheduler.add_job(schedule_tenants, "interval", hours=6, id="reschedule", next_run_time=datetime.now())
+        scheduler.start()
 
-    loop = asyncio.get_event_loop()
-    try:
-        loop.run_forever()
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+        try:
+            await asyncio.Event().wait()
+        except (KeyboardInterrupt, SystemExit):
+            scheduler.shutdown()
+
+    asyncio.run(_main())
 
 
 if __name__ == "__main__":

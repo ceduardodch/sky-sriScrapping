@@ -19,6 +19,12 @@ from app.models import Tenant, Comprobante, ScrapeLog  # noqa: F401
 
 target_metadata = Base.metadata
 
+# Allow DATABASE_URL env var to override alembic.ini
+import os as _os
+_db_url = _os.environ.get("DATABASE_URL")
+if _db_url:
+    config.set_main_option("sqlalchemy.url", _db_url)
+
 
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
