@@ -233,7 +233,24 @@ async def _ensure_sidebar_open(page: Page, timeout_ms: int) -> None:
             pass
         return
 
-    await hamburger.click()
+    # Esperar a que cualquier overlay de carga desaparezca antes del click
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15_000)
+    except Exception:
+        pass
+
+    try:
+        await hamburger.click(timeout=10_000)
+    except Exception:
+        log.warning("hamburger_click_failed_trying_force")
+        try:
+            await hamburger.click(force=True, timeout=5_000)
+        except Exception:
+            # Último recurso: click via JavaScript
+            try:
+                await hamburger.evaluate("el => el.click()")
+            except Exception as e:
+                log.warning("hamburger_js_click_failed", error=str(e))
     await human_delay(500, 900)
 
     # Esperar a que los items del menú sean visibles
