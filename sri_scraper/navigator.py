@@ -23,6 +23,12 @@ from .login import assert_authenticated
 
 log = structlog.get_logger(__name__)
 
+TUPORTAL_RECIBIDOS_URL = (
+    "https://srienlinea.sri.gob.ec/tuportal-internet/"
+    "accederAplicacion.jspa?redireccion=57&idGrupo=55"
+)
+COMPROBANTES_RECIBIDOS_PATH = "comprobantes-electronicos-internet"
+# Keep old constant for backwards compatibility
 TUPORTAL_RECIBIDOS_PARAM = "redireccion=57"
 
 
@@ -30,14 +36,11 @@ async def go_to_comprobantes_recibidos(page: Page, timeout_ms: int) -> None:
     """
     Navega desde el dashboard a Comprobantes electrónicos recibidos.
 
-    Flujo:
-      1. Espera a que el portal Angular cargue (spinner "Espere por favor")
-      2. Hace click en sección "FACTURACIÓN ELECTRÓNICA" del menú PrimeNG
-      3. Hace click en sub-item "Comprobantes electrónicos recibidos"
-      4. Espera la carga del portal tuportal-internet
-
-    No se usa goto() directo porque en Angular SPA una recarga completa
-    pierde el JWT del localStorage y redirige al login.
+    Estrategia:
+      1. Si ya estamos en la página de comprobantes, no hace nada.
+      2. Navega directamente via page.goto() al tuportal — el servidor redirige
+         al portal JSF de comprobantes electrónicos recibidos con el token de sesión.
+      3. Fallback: intenta navegar via menú (portal antiguo).
 
     Raises:
         SessionExpiredError: Si se detecta redirect al login.
@@ -46,15 +49,33 @@ async def go_to_comprobantes_recibidos(page: Page, timeout_ms: int) -> None:
     await assert_authenticated(page)
     log.info("navigation_started", target="comprobantes_recibidos", url=page.url)
 
-    # Si ya estamos en tuportal con el parámetro correcto, no hacer nada
-    if TUPORTAL_RECIBIDOS_PARAM in page.url:
+    # Si ya estamos en la página de comprobantes, no hacer nada
+    if COMPROBANTES_RECIBIDOS_PATH in page.url:
         log.info("navigation_skipped", reason="already_in_section")
         return
 
-    # Esperar a que el portal Angular termine de cargar
+    # Estrategia 1: Navegación directa (portal nuevo — redirige correctamente)
+    try:
+        log.info("navigation_direct_goto", url=TUPORTAL_RECIBIDOS_URL)
+        await page.goto(TUPORTAL_RECIBIDOS_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+        await human_delay(800, 1500)
+
+        if COMPROBANTES_RECIBIDOS_PATH in page.url:
+            log.info("navigation_success", url=page.url)
+            return
+
+        # Verificar si el contenido de la página indica éxito
+        content = await page.content()
+        if "Comprobantes electrónicos recibidos" in content or "comprobantesRecibidos" in page.url:
+            log.info("navigation_success_by_content", url=page.url)
+            return
+    except Exception as e:
+        log.warning("navigation_direct_failed", error=str(e))
+
+    # Estrategia 2: Via menú (portal con sidebar)
+    log.info("navigation_via_menu_fallback")
     await _wait_for_portal_ready(page, timeout_ms)
     await human_delay(800, 1500)
-
     await _navigate_via_menu(page, timeout_ms)
     log.info("navigation_success", url=page.url)
 
@@ -92,37 +113,63 @@ async def _wait_for_portal_ready(page: Page, timeout_ms: int) -> None:
 
 async def _navigate_via_menu(page: Page, timeout_ms: int) -> None:
     """
-    Navega usando el menú PrimeNG del portal Angular.
+    Navega al portal de Comprobantes Electrónicos Recibidos.
 
-    Menú real del portal (DOM inspeccionado):
-      - Sidebar: #mySidebar (w3-sidebar), colapsada por defecto
-      - Botón abrir: <span class="tamano-icono-hamburguesa ...">
-      - Secciones: elemento <a class="ui-panelmenu-header-link">
-      - Sub-items:  elemento <a class="ui-menuitem-link">
-      - Sección objetivo: "FACTURACIÓN ELECTRÓNICA"
-      - Sub-item objetivo: "Comprobantes electrónicos recibidos"
+    Estrategia en cascada:
+      1. Buscar link directo con href que contenga el parámetro de comprobantes recibidos
+      2. Expandir sección "FACTURACIÓN ELECTRÓNICA" en el sidebar y clickear sub-item
+      3. Abrir sidebar y volver a intentar estrategias anteriores
     """
 
-    # ── Paso 0: Abrir el sidebar si está colapsado ────────────────────────────
+    # ── Estrategia 1: Link directo en sidebar (nuevo portal con íconos) ───────
+    direct_selectors = [
+        f"a[href*='{TUPORTAL_RECIBIDOS_PARAM}']",
+        "a[href*='accederAplicacion'][href*='redireccion=57']",
+        "a[href*='comprobantes-electronicos'][href*='recibidos']",
+    ]
+
+    for sel in direct_selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=3_000):
+                log.debug("direct_link_found", selector=sel)
+                await el.click()
+                arrived = await _wait_for_tuportal(page, timeout_ms // 2)
+                if arrived:
+                    return
+        except PlaywrightTimeoutError:
+            continue
+
+    # ── Estrategia 2: Abrir sidebar y buscar con texto ─────────────────────────
     await _ensure_sidebar_open(page, timeout_ms)
     await human_delay(600, 1000)
 
-    # ── Paso 1: Expandir sección "FACTURACIÓN ELECTRÓNICA" ────────────────────
-    seccion = None
+    # Intentar link directo otra vez después de abrir sidebar
+    for sel in direct_selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=3_000):
+                log.debug("direct_link_found_after_sidebar", selector=sel)
+                await el.click()
+                arrived = await _wait_for_tuportal(page, timeout_ms // 2)
+                if arrived:
+                    return
+        except PlaywrightTimeoutError:
+            continue
+
+    # ── Estrategia 3: Menú PrimeNG (portal antiguo) ────────────────────────────
     selectors_seccion = [
-        # Texto exacto con diacrítico
         "a.ui-panelmenu-header-link:has-text('FACTURACIÓN ELECTRÓNICA')",
-        # Texto parcial más robusto
         "a.ui-panelmenu-header-link:has-text('ELECTR')",
-        # Sin clase (si el portal actualiza el CSS)
         ".ui-panelmenu-header-link:has-text('FACTUR')",
         "text=FACTURACIÓN ELECTRÓNICA",
     ]
 
+    seccion = None
     for sel in selectors_seccion:
         try:
             el = page.locator(sel).first
-            if await el.is_visible(timeout=5_000):
+            if await el.is_visible(timeout=3_000):
                 seccion = el
                 log.debug("menu_seccion_found", selector=sel)
                 break
@@ -140,19 +187,15 @@ async def _navigate_via_menu(page: Page, timeout_ms: int) -> None:
     await seccion.click()
     await human_delay(600, 1200)
 
-    # ── Paso 2: Click en "Comprobantes electrónicos recibidos" ────────────────
-    subitem = None
     selectors_subitem = [
-        # Por href (más estable que el texto)
         f"a[href*='{TUPORTAL_RECIBIDOS_PARAM}']",
-        # Por texto
         "a.ui-menuitem-link:has-text('recibidos')",
         ".ui-menuitem-link:has-text('Comprobantes electrónicos recibidos')",
         "text=Comprobantes electrónicos recibidos",
-        # Fallback sin clase
         "a:has-text('recibidos')",
     ]
 
+    subitem = None
     for sel in selectors_subitem:
         try:
             el = page.locator(sel).first
@@ -278,16 +321,19 @@ async def _wait_for_tuportal(page: Page, timeout_ms: int) -> bool:
         f"**{TUPORTAL_RECIBIDOS_PARAM}**",
     ]
 
-    # Primero verificar por URL
-    try:
-        await page.wait_for_url(
-            f"**{TUPORTAL_RECIBIDOS_PARAM}**",
-            timeout=timeout_ms,
-        )
-        log.debug("tuportal_url_confirmed", url=page.url)
-        return True
-    except PlaywrightTimeoutError:
-        pass
+    # Primero verificar por URL (dos patrones posibles según versión del portal)
+    url_patterns = [
+        f"**{TUPORTAL_RECIBIDOS_PARAM}**",
+        f"**{COMPROBANTES_RECIBIDOS_PATH}**",
+        "**comprobantesRecibidos**",
+    ]
+    for pattern in url_patterns:
+        try:
+            await page.wait_for_url(pattern, timeout=timeout_ms // len(url_patterns))
+            log.debug("tuportal_url_confirmed", url=page.url)
+            return True
+        except PlaywrightTimeoutError:
+            continue
 
     # Fallback: verificar elementos de la página
     page_indicators = [
