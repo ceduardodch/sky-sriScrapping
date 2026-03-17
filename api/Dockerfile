@@ -11,6 +11,7 @@ COPY api/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY api/ /app/api/
+COPY sri_scraper/ /app/sri_scraper/
 
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1

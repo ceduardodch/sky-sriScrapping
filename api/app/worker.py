@@ -100,10 +100,10 @@ async def _scrape_pipeline(
 
     from sri_scraper.config import SRIConfig
     from sri_scraper.browser import browser_context
-    from sri_scraper.login import do_login
+    from sri_scraper.login import login
     from sri_scraper.navigator import go_to_comprobantes_recibidos
     from sri_scraper.downloader import download_report
-    from sri_scraper.parser import parse_claves_from_file
+    from sri_scraper.parser import extract_claves_from_file
     from sri_scraper.soap_client import SRISOAPClient
 
     target_date = date.today()  # descarga el día de ayer (config lo maneja)
@@ -122,9 +122,8 @@ async def _scrape_pipeline(
     # ── Fase 1: Browser → TXT ──────────────────────────────────────────────────
     txt_path: Path | None = None
     async with browser_context(config) as ctx:
-        page = await ctx.new_page()
-        await do_login(page, config)
-        await go_to_comprobantes_recibidos(page)
+        page = await login(ctx, config)
+        await go_to_comprobantes_recibidos(page, config.page_timeout_ms)
         txt_path = await download_report(page, config)
 
     if txt_path is None:
@@ -132,7 +131,7 @@ async def _scrape_pipeline(
         return 0
 
     # ── Fase 2: Parse claves ───────────────────────────────────────────────────
-    claves = parse_claves_from_file(txt_path)
+    claves = extract_claves_from_file(txt_path)
     if not claves:
         return 0
 
@@ -186,7 +185,25 @@ def start_scheduler() -> None:
     from apscheduler.triggers.cron import CronTrigger
 
     async def _main() -> None:
-        scheduler = AsyncIOScheduler(timezone="America/Guayaquil")
+        import pytz
+        _tz = pytz.timezone("America/Guayaquil")
+        scheduler = AsyncIOScheduler(timezone=_tz)
+
+        async def run_pending_scrapes() -> None:
+            """Ejecuta inmediatamente cualquier ScrapeLog con status='pending'."""
+            from .database import AsyncSessionLocal
+            from .models import ScrapeLog
+            from sqlalchemy import select
+            async with AsyncSessionLocal() as session:
+                pending = (await session.execute(
+                    select(ScrapeLog).where(ScrapeLog.status == "pending")
+                )).scalars().all()
+                for scrape_log in pending:
+                    scrape_log.status = "running"
+                await session.commit()
+            for scrape_log in pending:
+                log.info("worker_trigger_pending", log_id=scrape_log.id, tenant_id=scrape_log.tenant_id)
+                await run_scrape_for_tenant(scrape_log.tenant_id, scrape_log.id)
 
         async def schedule_tenants() -> None:
             """Reagenda jobs al inicio y cada 6 horas para detectar nuevos tenants."""
@@ -231,7 +248,9 @@ def start_scheduler() -> None:
                 log.info("job_scheduled", tenant_id=tenant.id, at=f"{hour:02d}:{minute:02d}")
 
         # Reagendar tenants al inicio y cada 6 horas
-        scheduler.add_job(schedule_tenants, "interval", hours=6, id="reschedule", next_run_time=datetime.now())
+        scheduler.add_job(schedule_tenants, "interval", hours=6, id="reschedule", next_run_time=datetime.now(_tz))
+        # Polling de scrapes pendientes (trigger manual via API)
+        scheduler.add_job(run_pending_scrapes, "interval", seconds=30, id="pending_poll", next_run_time=datetime.now(_tz))
         scheduler.start()
 
         try:

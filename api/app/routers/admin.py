@@ -95,18 +95,14 @@ async def trigger_scrape(
     if not tenant.active:
         raise HTTPException(status_code=400, detail="Tenant inactivo")
 
-    # Crear registro de log
-    log = ScrapeLog(tenant_id=tenant_id, status="running")
+    # Crear registro pendiente — el worker lo ejecuta en su próximo ciclo
+    log = ScrapeLog(tenant_id=tenant_id, status="pending")
     session.add(log)
     await session.commit()
     await session.refresh(log)
 
-    # Ejecutar en background (no bloquea la respuesta HTTP)
-    from ..worker import run_scrape_for_tenant
-    background_tasks.add_task(run_scrape_for_tenant, tenant_id, log.id)
-
     return TriggerOut(
-        message="Scraping iniciado en background",
+        message="Scraping encolado — el worker lo ejecutará en segundos",
         tenant_id=tenant_id,
         log_id=log.id,
     )
