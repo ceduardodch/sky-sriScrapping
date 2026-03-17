@@ -294,13 +294,42 @@ async def _set_periodo_selects(page: Page, target_date: date) -> None:
         log.warning("day_select_failed", error=str(e))
 
 
+async def _humanize_before_consultar(page: Page) -> None:
+    """
+    Simula comportamiento humano antes de hacer click en Consultar.
+    Esto mejora el score de reCAPTCHA v3 que evalúa el comportamiento del usuario.
+    """
+    import random
+    # Scroll suave por la página
+    await page.evaluate("window.scrollTo(0, 200)")
+    await human_delay(400, 800)
+    await page.evaluate("window.scrollTo(0, 0)")
+    await human_delay(300, 600)
+
+    # Mover el mouse sobre el formulario antes de hacer click
+    try:
+        # Hover sobre el campo RUC
+        ruc_field = page.locator("input[type='text']").first
+        await ruc_field.hover()
+        await human_delay(200, 400)
+    except Exception:
+        pass
+
+    # Espera adicional para que reCAPTCHA v3 score la sesión
+    await human_delay(2000, 3500)
+
+
 async def _click_consultar(page: Page, config: SRIConfig) -> None:
     """
     Hace click en el botón "Consultar" del portal de comprobantes.
+    Incluye comportamiento humano previo para mejorar score de reCAPTCHA v3.
+    Detecta "Captcha incorrecta" y reintenta una vez.
 
     Raises:
-        DownloadError: Si el botón no se encuentra.
+        DownloadError: Si el botón no se encuentra o el captcha sigue fallando.
     """
+    await _humanize_before_consultar(page)
+
     selectors = [
         "button:has-text('Consultar')",
         "input[value='Consultar']",
@@ -308,28 +337,68 @@ async def _click_consultar(page: Page, config: SRIConfig) -> None:
         "input[type='submit']",
     ]
 
+    consultar_btn = None
     for sel in selectors:
         try:
             el = page.locator(sel).first
             if await el.is_visible(timeout=3_000):
-                await el.click()
-                log.debug("consultar_btn_clicked", selector=sel)
-                return
+                consultar_btn = el
+                log.debug("consultar_btn_found", selector=sel)
+                break
         except PlaywrightTimeoutError:
             continue
 
-    screenshot_path = str(config.logs_dir / "download_debug_consultar.png")
-    await page.screenshot(path=screenshot_path)
-    raise DownloadError(
-        f"No se encontró el botón 'Consultar'. Screenshot: {screenshot_path}"
-    )
+    if consultar_btn is None:
+        screenshot_path = str(config.logs_dir / "download_debug_consultar.png")
+        await page.screenshot(path=screenshot_path)
+        raise DownloadError(
+            f"No se encontró el botón 'Consultar'. Screenshot: {screenshot_path}"
+        )
+
+    await consultar_btn.click()
+    log.debug("consultar_btn_clicked")
+
+    # Esperar respuesta AJAX
+    await human_delay(3000, 5000)
+
+    # Detectar "Captcha incorrecta" y reintentar una vez
+    captcha_error_selectors = [
+        "text=Captcha incorrecta",
+        "text=Captcha error",
+        "text=captcha",
+        "[class*='captcha'][class*='error']",
+        "[class*='alert']:has-text('captcha')",
+    ]
+    captcha_failed = False
+    for sel in captcha_error_selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=2_000):
+                captcha_failed = True
+                log.warning("captcha_failed_retrying", selector=sel)
+                break
+        except PlaywrightTimeoutError:
+            continue
+
+    if captcha_failed:
+        # Esperar más tiempo para que reCAPTCHA v3 mejore el score
+        await human_delay(5000, 8000)
+        # Scroll adicional para simular más actividad
+        await page.evaluate("window.scrollTo(0, 300)")
+        await human_delay(500, 1000)
+        await page.evaluate("window.scrollTo(0, 0)")
+        await human_delay(1000, 2000)
+        # Reintentar click en Consultar
+        await consultar_btn.click()
+        log.info("consultar_retry_after_captcha")
+        await human_delay(3000, 5000)
 
 
 async def _is_empty_result(page: Page) -> bool:
     """
     Detecta si la consulta no retornó comprobantes (día sin actividad = normal).
 
-    Retorna True si el portal muestra un indicador de "sin resultados".
+    Retorna True si el portal muestra un indicador de "sin resultados" o CAPTCHA fallido.
     """
     empty_texts = [
         "No se encontraron resultados",
@@ -339,6 +408,9 @@ async def _is_empty_result(page: Page) -> bool:
         "0 registros",
         "No existen resultados",
         "no se encontraron",
+        "No existe informaci",   # "No existe información para..."
+        "no existe inform",
+        "Sin resultados",
     ]
 
     for text in empty_texts:
@@ -346,6 +418,20 @@ async def _is_empty_result(page: Page) -> bool:
             el = page.locator(f"text={text}").first
             if await el.is_visible(timeout=2_000):
                 log.debug("empty_result_detected", text=text)
+                return True
+        except PlaywrightTimeoutError:
+            continue
+
+    # Si el CAPTCHA sigue fallando después del retry, tratar como vacío
+    captcha_error_selectors = [
+        "text=Captcha incorrecta",
+        "text=Captcha error",
+    ]
+    for sel in captcha_error_selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=1_000):
+                log.warning("captcha_still_failing_treating_as_empty")
                 return True
         except PlaywrightTimeoutError:
             continue
