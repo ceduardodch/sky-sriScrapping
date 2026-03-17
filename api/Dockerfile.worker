@@ -1,0 +1,38 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Dependencias de sistema: Chrome/Chromium + Xvfb + lxml
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # lxml
+    libxml2-dev libxslt1-dev gcc \
+    # Chromium y dependencias de display
+    chromium chromium-driver \
+    xvfb x11-utils \
+    # Fuentes y misc
+    fonts-liberation fonts-noto-cjk \
+    ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Instalar dependencias de la API (scheduler, httpx, etc.)
+COPY api/requirements.txt /tmp/api_req.txt
+RUN pip install --no-cache-dir -r /tmp/api_req.txt
+
+# Instalar dependencias del scraper
+COPY requirements.txt /tmp/scraper_req.txt
+RUN pip install --no-cache-dir -r /tmp/scraper_req.txt
+
+# Instalar Patchright y su Chromium parcheado
+RUN pip install --no-cache-dir patchright==1.58.2 && \
+    python -m patchright install chromium
+
+# Copiar código
+COPY api/ /app/api/
+COPY sri_scraper/ /app/sri_scraper/
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+# Chromium necesita --no-sandbox en Docker
+ENV CHROMIUM_FLAGS="--no-sandbox --disable-dev-shm-usage"
+
+CMD ["python", "-m", "api.app.worker"]

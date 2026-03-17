@@ -1,0 +1,33 @@
+# Browser automation con stealth (NO instalar playwright por separado)
+patchright==1.58.2
+
+# Fallback stealth Firefox (si Chrome es bloqueado por el SRI)
+camoufox==0.4.11
+
+# Config y variables de entorno
+pydantic-settings==2.13.1
+python-dotenv==1.2.2
+
+# Retry con backoff exponencial
+tenacity==9.1.4
+
+# Logging estructurado
+structlog==25.5.0
+
+# Terminal output legible
+rich==14.3.3
+
+# CLI
+click==8.3.1
+
+# SOAP client para el WS de autorización SRI
+zeep==4.3.2
+
+# HTTP client para push a API
+httpx==0.28.1
+
+# Cifrado de credenciales SRI
+cryptography==44.0.2
+
+# Tests (dev)
+pytest>=9.0
