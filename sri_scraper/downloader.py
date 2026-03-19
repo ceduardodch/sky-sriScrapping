@@ -294,13 +294,42 @@ async def _set_periodo_selects(page: Page, target_date: date) -> None:
         log.warning("day_select_failed", error=str(e))
 
 
+async def _humanize_before_consultar(page: Page) -> None:
+    """
+    Simula comportamiento humano antes de hacer click en Consultar.
+    Esto mejora el score de reCAPTCHA v3 que evalúa el comportamiento del usuario.
+    """
+    import random
+    # Scroll suave por la página
+    await page.evaluate("window.scrollTo(0, 200)")
+    await human_delay(400, 800)
+    await page.evaluate("window.scrollTo(0, 0)")
+    await human_delay(300, 600)
+
+    # Mover el mouse sobre el formulario antes de hacer click
+    try:
+        # Hover sobre el campo RUC
+        ruc_field = page.locator("input[type='text']").first
+        await ruc_field.hover()
+        await human_delay(200, 400)
+    except Exception:
+        pass
+
+    # Espera adicional para que reCAPTCHA v3 score la sesión
+    await human_delay(2000, 3500)
+
+
 async def _click_consultar(page: Page, config: SRIConfig) -> None:
     """
     Hace click en el botón "Consultar" del portal de comprobantes.
+    Incluye comportamiento humano previo para mejorar score de reCAPTCHA v3.
+    Detecta "Captcha incorrecta" y reintenta una vez.
 
     Raises:
-        DownloadError: Si el botón no se encuentra.
+        DownloadError: Si el botón no se encuentra o el captcha sigue fallando.
     """
+    await _humanize_before_consultar(page)
+
     selectors = [
         "button:has-text('Consultar')",
         "input[value='Consultar']",
@@ -308,28 +337,68 @@ async def _click_consultar(page: Page, config: SRIConfig) -> None:
         "input[type='submit']",
     ]
 
+    consultar_btn = None
     for sel in selectors:
         try:
             el = page.locator(sel).first
             if await el.is_visible(timeout=3_000):
-                await el.click()
-                log.debug("consultar_btn_clicked", selector=sel)
-                return
+                consultar_btn = el
+                log.debug("consultar_btn_found", selector=sel)
+                break
         except PlaywrightTimeoutError:
             continue
 
-    screenshot_path = str(config.logs_dir / "download_debug_consultar.png")
-    await page.screenshot(path=screenshot_path)
-    raise DownloadError(
-        f"No se encontró el botón 'Consultar'. Screenshot: {screenshot_path}"
-    )
+    if consultar_btn is None:
+        screenshot_path = str(config.logs_dir / "download_debug_consultar.png")
+        await page.screenshot(path=screenshot_path)
+        raise DownloadError(
+            f"No se encontró el botón 'Consultar'. Screenshot: {screenshot_path}"
+        )
+
+    await consultar_btn.click()
+    log.debug("consultar_btn_clicked")
+
+    # Esperar respuesta AJAX
+    await human_delay(3000, 5000)
+
+    # Detectar "Captcha incorrecta" y reintentar una vez
+    captcha_error_selectors = [
+        "text=Captcha incorrecta",
+        "text=Captcha error",
+        "text=captcha",
+        "[class*='captcha'][class*='error']",
+        "[class*='alert']:has-text('captcha')",
+    ]
+    captcha_failed = False
+    for sel in captcha_error_selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=2_000):
+                captcha_failed = True
+                log.warning("captcha_failed_retrying", selector=sel)
+                break
+        except PlaywrightTimeoutError:
+            continue
+
+    if captcha_failed:
+        # Esperar más tiempo para que reCAPTCHA v3 mejore el score
+        await human_delay(5000, 8000)
+        # Scroll adicional para simular más actividad
+        await page.evaluate("window.scrollTo(0, 300)")
+        await human_delay(500, 1000)
+        await page.evaluate("window.scrollTo(0, 0)")
+        await human_delay(1000, 2000)
+        # Reintentar click en Consultar
+        await consultar_btn.click()
+        log.info("consultar_retry_after_captcha")
+        await human_delay(3000, 5000)
 
 
 async def _is_empty_result(page: Page) -> bool:
     """
     Detecta si la consulta no retornó comprobantes (día sin actividad = normal).
 
-    Retorna True si el portal muestra un indicador de "sin resultados".
+    Retorna True si el portal muestra un indicador de "sin resultados" o CAPTCHA fallido.
     """
     empty_texts = [
         "No se encontraron resultados",
@@ -339,6 +408,9 @@ async def _is_empty_result(page: Page) -> bool:
         "0 registros",
         "No existen resultados",
         "no se encontraron",
+        "No existe informaci",   # "No existe información para..."
+        "no existe inform",
+        "Sin resultados",
     ]
 
     for text in empty_texts:
@@ -346,6 +418,36 @@ async def _is_empty_result(page: Page) -> bool:
             el = page.locator(f"text={text}").first
             if await el.is_visible(timeout=2_000):
                 log.debug("empty_result_detected", text=text)
+                return True
+        except PlaywrightTimeoutError:
+            continue
+
+    # Si el CAPTCHA sigue fallando después del retry, tratar como vacío
+    captcha_error_selectors = [
+        "text=Captcha incorrecta",
+        "text=Captcha error",
+    ]
+    for sel in captcha_error_selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=1_000):
+                log.warning("captcha_still_failing_treating_as_empty")
+                return True
+        except PlaywrightTimeoutError:
+            continue
+
+    # Error de validación de fecha: portal rechaza la fecha ingresada
+    date_error_texts = [
+        "La fecha ingresada debe ser menor",
+        "fecha ingresada debe ser",
+        "fecha debe ser menor",
+        "No existen datos para los parámetros",
+    ]
+    for text in date_error_texts:
+        try:
+            el = page.locator(f"text={text}").first
+            if await el.is_visible(timeout=1_000):
+                log.warning("date_validation_error_treating_as_empty", text=text)
                 return True
         except PlaywrightTimeoutError:
             continue
@@ -396,7 +498,35 @@ async def _do_download(
             f"Screenshot: {screenshot_path}"
         )
 
-    # ── Estrategia 1: evento nativo de descarga (Content-Disposition: attachment) ──
+    # Log de atributos del botón para diagnóstico
+    try:
+        href = await download_btn.get_attribute("href")
+        onclick = await download_btn.get_attribute("onclick")
+        log.debug("download_btn_attrs", href=href, onclick=(onclick or "")[:120])
+    except Exception:
+        pass
+
+    # ── Estrategia 1: intercepción de respuesta HTTP (JSF iframe/form submit) ──
+    # PrimeFaces p:fileDownload puede enviar el archivo como respuesta a un POST
+    # de un iframe oculto — expect_download no lo captura pero sí on("response")
+    captured_body: list[bytes] = []
+
+    async def _on_response(response) -> None:
+        cd = response.headers.get("content-disposition", "")
+        ct = response.headers.get("content-type", "")
+        if "attachment" in cd or (
+            ct.startswith("text/plain") and response.status == 200
+            and "comprobante" in response.url.lower()
+        ):
+            try:
+                body = await response.body()
+                if len(body) > 50:
+                    captured_body.append(body)
+                    log.info("response_intercepted", url=response.url, size=len(body), cd=cd)
+            except Exception as e:
+                log.warning("response_body_read_failed", error=str(e))
+
+    page.on("response", _on_response)
     try:
         async with page.expect_download(timeout=30_000) as dl_info:
             await download_btn.click()
@@ -411,12 +541,22 @@ async def _do_download(
         raise DownloadError(f"Archivo vacío: {dest}")
 
     except PlaywrightTimeoutError:
-        log.warning("download_event_timeout_30s", note="probando estrategia de navegación")
+        log.warning("download_event_timeout_30s", note="revisando intercepción HTTP")
+        await human_delay(3000, 5000)  # dar tiempo al response handler async
+    finally:
+        page.remove_listener("response", _on_response)
+
+    # ¿Se capturó el contenido vía intercepción de respuesta?
+    if captured_body:
+        dest.write_bytes(captured_body[0])
+        if dest.stat().st_size > 0:
+            log.info("download_from_response_intercept", path=str(dest), size=dest.stat().st_size)
+            return dest
 
     # ── Estrategia 2: el link navega a una URL con el TXT directamente ──────────
     try:
         pre_url = page.url
-        async with page.expect_navigation(timeout=30_000):
+        async with page.expect_navigation(timeout=15_000):
             await download_btn.click()
 
         post_url = page.url
@@ -438,6 +578,6 @@ async def _do_download(
     screenshot_path = str(config.logs_dir / "download_timeout.png")
     await page.screenshot(path=screenshot_path, full_page=True)
     raise DownloadError(
-        f"No se pudo capturar la descarga del TXT tras dos estrategias. "
+        f"No se pudo capturar la descarga del TXT tras todas las estrategias. "
         f"Screenshot: {screenshot_path}"
     )

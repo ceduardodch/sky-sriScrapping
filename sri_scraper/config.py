@@ -15,6 +15,7 @@ class SRIConfig(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        env_ignore_empty=True,  # Empty env vars treated as unset (use defaults)
     )
 
     # ── Credenciales ──────────────────────────────────────────────────────────
@@ -67,8 +68,14 @@ class SRIConfig(BaseSettings):
 
     @property
     def effective_report_date(self) -> date:
-        """Retorna la fecha configurada o ayer si no se especificó."""
-        return self.report_date or (date.today() - timedelta(days=1))
+        """Retorna la fecha configurada o ayer en hora Ecuador si no se especificó."""
+        if self.report_date:
+            return self.report_date
+        import pytz
+        from datetime import datetime
+        ec_tz = pytz.timezone("America/Guayaquil")
+        today_ec = datetime.now(ec_tz).date()
+        return today_ec - timedelta(days=1)
 
     def ensure_dirs(self) -> None:
         """Crea los directorios de runtime si no existen."""

@@ -241,7 +241,7 @@ def start_scheduler() -> None:
 
                 scheduler.add_job(
                     _run,
-                    CronTrigger(hour=hour, minute=minute),
+                    CronTrigger(hour=hour, minute=minute, timezone=_tz),
                     id=f"scrape_{tenant.id}",
                     replace_existing=True,
                 )
