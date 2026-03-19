@@ -43,6 +43,10 @@ class SRIConfig(BaseSettings):
     api_key: Optional[str] = None        # ADMIN_API_KEY de la API
     api_tenant_id: Optional[int] = None  # ID del tenant en la API
 
+    # ── CAPTCHA solver (opcional) ─────────────────────────────────────────────
+    # Registro gratuito en 2captcha.com (~$3/1000 solves ≈ $1/año por tenant)
+    twocaptcha_api_key: Optional[str] = None
+
     # ── Paths (resueltos relativos al CWD) ────────────────────────────────────
     downloads_dir: Path = Path("downloads")
     state_dir: Path = Path("state")

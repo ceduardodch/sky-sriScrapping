@@ -13,10 +13,12 @@ y los resultados se combinan en un único TXT final.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import structlog
 from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
@@ -26,6 +28,10 @@ from .exceptions import DownloadError
 from .login import assert_authenticated
 
 log = structlog.get_logger(__name__)
+
+# ── reCAPTCHA Enterprise (portal SRI comprobantes) ────────────────────────────
+_RECAPTCHA_SITE_KEY = "6LdukTQsAAAAAIcciM4GZq4ibeyplUhmWvlScuQE"
+_RECAPTCHA_ACTION   = "consulta_cel_recibidos"
 
 # Nombres de mes en español tal como aparecen en el portal SRI
 MESES_ES: dict[int, str] = {
@@ -294,42 +300,149 @@ async def _set_periodo_selects(page: Page, target_date: date) -> None:
         log.warning("day_select_failed", error=str(e))
 
 
-async def _humanize_before_consultar(page: Page) -> None:
+async def _solve_recaptcha_2captcha(page_url: str, api_key: str) -> Optional[str]:
+    """
+    Resuelve reCAPTCHA Enterprise v3 usando la API de 2captcha.
+
+    Documentación: https://2captcha.com/api-docs/recaptcha-v3
+    Costo: ~$3 / 1000 solves ≈ $1/año con un scrape diario por tenant.
+
+    Returns:
+        Token válido (string largo) o None si falla.
+    """
+    log.info("2captcha_solving_started", url=page_url, action=_RECAPTCHA_ACTION)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            # 1) Crear tarea
+            resp = await client.post(
+                "https://api.2captcha.com/createTask",
+                json={
+                    "clientKey": api_key,
+                    "task": {
+                        "type": "RecaptchaV3TaskProxyless",
+                        "websiteURL": page_url,
+                        "websiteKey": _RECAPTCHA_SITE_KEY,
+                        "pageAction": _RECAPTCHA_ACTION,
+                        "isEnterprise": True,
+                        "minScore": 0.5,
+                    },
+                },
+            )
+        data = resp.json()
+        if data.get("errorId", 1) != 0:
+            log.warning("2captcha_create_failed", error=data.get("errorDescription"), code=data.get("errorCode"))
+            return None
+
+        task_id = data["taskId"]
+        log.info("2captcha_task_created", task_id=task_id)
+
+        # 2) Polling para resultado (máx 2 minutos)
+        for attempt in range(24):
+            await asyncio.sleep(5)
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://api.2captcha.com/getTaskResult",
+                    json={"clientKey": api_key, "taskId": task_id},
+                )
+            result = resp.json()
+            status = result.get("status")
+            if status == "ready":
+                token = result["solution"]["gRecaptchaResponse"]
+                log.info("2captcha_solved", attempts=attempt + 1, token_prefix=token[:20])
+                return token
+            elif status == "processing":
+                log.debug("2captcha_still_processing", attempt=attempt + 1)
+                continue
+            else:
+                log.warning("2captcha_unexpected_status", status=status, data=result)
+                return None
+
+        log.warning("2captcha_timeout_2min")
+        return None
+
+    except Exception as e:
+        log.warning("2captcha_exception", error=str(e))
+        return None
+
+
+async def _inject_and_submit_with_token(page: Page, token: str) -> None:
+    """
+    Inyecta el token de reCAPTCHA en el campo oculto y dispara
+    onSubmit() directamente (bypasando el flujo normal de reCAPTCHA).
+    """
+    await page.evaluate(
+        """
+        (token) => {
+            // Rellenar todos los campos g-recaptcha-response de la página
+            document.querySelectorAll('[name="g-recaptcha-response"]').forEach(el => {
+                el.value = token;
+            });
+            // Llamar onSubmit() que internamente llama rcBuscar() → PrimeFaces AJAX
+            if (typeof onSubmit === 'function') {
+                onSubmit();
+            } else if (typeof rcBuscar === 'function') {
+                rcBuscar();
+            }
+        }
+        """,
+        token,
+    )
+    log.info("2captcha_token_injected_and_submitted")
+
+
+async def _humanize_before_consultar(page: Page, config: Optional["SRIConfig"] = None) -> None:
     """
     Simula comportamiento humano antes de hacer click en Consultar.
-    Esto mejora el score de reCAPTCHA v3 que evalúa el comportamiento del usuario.
+    Mejora el score de reCAPTCHA v3 Enterprise para el modo sin solver.
     """
-    import random
     # Scroll suave por la página
     await page.evaluate("window.scrollTo(0, 200)")
     await human_delay(400, 800)
     await page.evaluate("window.scrollTo(0, 0)")
     await human_delay(300, 600)
 
-    # Mover el mouse sobre el formulario antes de hacer click
+    # Hover sobre el campo RUC para simular lectura
     try:
-        # Hover sobre el campo RUC
         ruc_field = page.locator("input[type='text']").first
         await ruc_field.hover()
         await human_delay(200, 400)
     except Exception:
         pass
 
-    # Espera adicional para que reCAPTCHA v3 score la sesión
+    # Espera adicional para que reCAPTCHA Enterprise score la sesión
     await human_delay(2000, 3500)
 
 
 async def _click_consultar(page: Page, config: SRIConfig) -> None:
     """
     Hace click en el botón "Consultar" del portal de comprobantes.
-    Incluye comportamiento humano previo para mejorar score de reCAPTCHA v3.
-    Detecta "Captcha incorrecta" y reintenta una vez.
+
+    Estrategia 1 (si TWOCAPTCHA_API_KEY configurado):
+      - Resuelve reCAPTCHA Enterprise via 2captcha
+      - Inyecta token en g-recaptcha-response
+      - Dispara onSubmit() directamente
+
+    Estrategia 2 (fallback sin solver):
+      - Humanización + click normal
+      - 3 reintentos con delays crecientes
+      - Si sigue fallando, deja que _is_empty_result() lo detecte
 
     Raises:
-        DownloadError: Si el botón no se encuentra o el captcha sigue fallando.
+        DownloadError: Si el botón no se encuentra.
     """
-    await _humanize_before_consultar(page)
+    await _humanize_before_consultar(page, config)
 
+    # ── Estrategia 1: 2captcha solver ─────────────────────────────────────────
+    if config.twocaptcha_api_key:
+        token = await _solve_recaptcha_2captcha(page.url, config.twocaptcha_api_key)
+        if token:
+            await _inject_and_submit_with_token(page, token)
+            log.info("consultar_via_2captcha")
+            return
+        else:
+            log.warning("2captcha_failed_falling_back_to_click")
+
+    # ── Estrategia 2: click normal con reintentos ──────────────────────────────
     selectors = [
         "button:has-text('Consultar')",
         "input[value='Consultar']",
@@ -355,43 +468,43 @@ async def _click_consultar(page: Page, config: SRIConfig) -> None:
             f"No se encontró el botón 'Consultar'. Screenshot: {screenshot_path}"
         )
 
-    await consultar_btn.click()
-    log.debug("consultar_btn_clicked")
-
-    # Esperar respuesta AJAX
-    await human_delay(3000, 5000)
-
-    # Detectar "Captcha incorrecta" y reintentar una vez
     captcha_error_selectors = [
         "text=Captcha incorrecta",
         "text=Captcha error",
-        "text=captcha",
-        "[class*='captcha'][class*='error']",
         "[class*='alert']:has-text('captcha')",
     ]
-    captcha_failed = False
-    for sel in captcha_error_selectors:
-        try:
-            el = page.locator(sel).first
-            if await el.is_visible(timeout=2_000):
-                captcha_failed = True
-                log.warning("captcha_failed_retrying", selector=sel)
-                break
-        except PlaywrightTimeoutError:
-            continue
 
-    if captcha_failed:
-        # Esperar más tiempo para que reCAPTCHA v3 mejore el score
-        await human_delay(5000, 8000)
-        # Scroll adicional para simular más actividad
-        await page.evaluate("window.scrollTo(0, 300)")
-        await human_delay(500, 1000)
-        await page.evaluate("window.scrollTo(0, 0)")
-        await human_delay(1000, 2000)
-        # Reintentar click en Consultar
+    # Hasta 3 intentos con delays crecientes
+    for attempt in range(3):
         await consultar_btn.click()
-        log.info("consultar_retry_after_captcha")
+        log.debug("consultar_btn_clicked", attempt=attempt + 1)
         await human_delay(3000, 5000)
+
+        captcha_failed = False
+        for sel in captcha_error_selectors:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=2_000):
+                    captcha_failed = True
+                    log.warning("captcha_failed_retrying", selector=sel, attempt=attempt + 1)
+                    break
+            except PlaywrightTimeoutError:
+                continue
+
+        if not captcha_failed:
+            log.info("consultar_clicked", attempt=attempt + 1)
+            return  # Éxito
+
+        if attempt < 2:
+            wait_ms = (attempt + 1) * 10_000
+            log.info("consultar_retry_after_captcha", wait_ms=wait_ms)
+            await human_delay(wait_ms, wait_ms + 5000)
+            await page.evaluate("window.scrollTo(0, 300)")
+            await human_delay(800, 1500)
+            await page.evaluate("window.scrollTo(0, 0)")
+            await human_delay(500, 1000)
+
+    log.warning("consultar_captcha_exhausted_retries")
 
 
 async def _is_empty_result(page: Page) -> bool:
