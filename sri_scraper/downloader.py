@@ -14,6 +14,7 @@ y los resultados se combinan en un único TXT final.
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import date
 from pathlib import Path
 from typing import Optional
@@ -511,7 +512,10 @@ async def _is_empty_result(page: Page) -> bool:
     """
     Detecta si la consulta no retornó comprobantes (día sin actividad = normal).
 
-    Retorna True si el portal muestra un indicador de "sin resultados" o CAPTCHA fallido.
+    Retorna True si:
+    - El portal muestra texto de "sin resultados"
+    - No hay tabla de resultados con filas de datos (RichFaces / tabla JSF)
+    - El CAPTCHA sigue fallando
     """
     empty_texts = [
         "No se encontraron resultados",
@@ -524,6 +528,8 @@ async def _is_empty_result(page: Page) -> bool:
         "No existe informaci",   # "No existe información para..."
         "no existe inform",
         "Sin resultados",
+        "No existen datos para los par",  # "No existen datos para los parámetros ingresados"
+        "no existen datos",
     ]
 
     for text in empty_texts:
@@ -549,7 +555,105 @@ async def _is_empty_result(page: Page) -> bool:
         except PlaywrightTimeoutError:
             continue
 
+    # ── PrimeFaces formMessages: solo mensajes VISIBLES con texto exacto ─────────
+    # Solo aplica si el mensaje de advertencia es visible en pantalla (no en JS)
+    try:
+        msg_el = page.locator("#formMessages\\:messages .ui-messages-warn")
+        if await msg_el.is_visible(timeout=2_000):
+            msg_text = await msg_el.inner_text()
+            log.debug("form_message_warn", text=msg_text[:100])
+            # Solo textos muy específicos del portal SRI (no genéricos)
+            specific_empty = [
+                "no existen datos para los par",
+                "no existen comprobantes recibidos",
+            ]
+            if any(t in msg_text.lower() for t in specific_empty):
+                return True
+    except PlaywrightTimeoutError:
+        pass
+    except Exception:
+        pass
+
+    # ── RichFaces "no data" row (visible en tabla vacía) ─────────────────────
+    rf_nodata_selectors = [
+        ".rf-nodata",
+        ".rf-nodata-i",
+        "tr.rf-dt-nd-r",
+    ]
+    for sel in rf_nodata_selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=2_000):
+                log.debug("rf_nodata_detected", selector=sel)
+                return True
+        except PlaywrightTimeoutError:
+            continue
+
     return False
+
+
+_CLAVE_RE = re.compile(r"(?<!\d)(\d{49})(?!\d)")
+
+# Regex para 49-digit access keys used in DOM scraping strategy
+
+
+async def _extract_claves_from_dom(page: Page, dest: Path) -> Optional[Path]:
+    """
+    Extrae claves de acceso (49 dígitos) directamente del DOM de la página.
+
+    Estrategia principal post-Consultar:
+    El portal SRI renderiza la tabla de resultados en el DOM. Aunque el botón
+    "Descargar reporte" usa JSF stateful POST (frágil), las claves de acceso
+    ya están visibles en la página tras el AJAX de Consultar.
+
+    Buscamos primero en el HTML completo, luego en el innerText de las tablas.
+
+    Returns:
+        Path del TXT con las claves encontradas, o None si no hay ninguna.
+    """
+    try:
+        # Estrategia A: HTML completo (rápido, captura data-* attrs, value= ocultos, etc.)
+        content = await page.content()
+        claves = _CLAVE_RE.findall(content)
+
+        if claves:
+            unique_claves = list(dict.fromkeys(claves))  # Deduplicar preservando orden
+            dest.write_text("\n".join(unique_claves) + "\n", encoding="utf-8")
+            log.info(
+                "dom_extraction_html_success",
+                claves_found=len(unique_claves),
+                path=str(dest),
+            )
+            return dest
+
+        # Estrategia B: innerText de tablas (por si el JS oculta en attrs data)
+        table_text: str = await page.evaluate(
+            """
+            () => {
+                const tables = document.querySelectorAll('table');
+                let text = '';
+                tables.forEach(t => { text += t.innerText + '\\n'; });
+                return text;
+            }
+            """
+        )
+        claves_b = _CLAVE_RE.findall(table_text)
+        if claves_b:
+            unique_b = list(dict.fromkeys(claves_b))
+            dest.write_text("\n".join(unique_b) + "\n", encoding="utf-8")
+            log.info(
+                "dom_extraction_table_success",
+                claves_found=len(unique_b),
+                path=str(dest),
+            )
+            return dest
+
+        log.info("dom_extraction_no_claves_in_page")
+        return None
+
+    except Exception as e:
+        log.warning("dom_extraction_failed", error=str(e))
+        return None
 
 
 async def _do_download(
@@ -558,11 +662,31 @@ async def _do_download(
     dest: Path,
 ) -> Optional[Path]:
     """
-    Hace click en "Descargar reporte" y guarda el TXT en ``dest``.
+    Extrae el reporte de comprobantes y lo guarda en ``dest``.
+
+    Estrategia 0 (primera y más robusta): extracción directa del DOM.
+      El portal JSF renderiza los resultados en la tabla justo después del
+      AJAX de Consultar. Buscamos directamente en el HTML las claves de 49
+      dígitos — sin depender del botón "Descargar reporte".
+
+    Si Strategy 0 no encuentra claves, intenta las estrategias de botón:
+      1. Evento nativo download de Playwright (Content-Disposition: attachment)
+      2. Intercepción de respuesta HTTP (JSF/PrimeFaces iframe oculto)
+      3. Espera extra 10 s (respuesta tardía)
+      4. Captura del popup/nueva pestaña
+      5. page.route() JSF intercept
+      6. Fetch directo con httpx + cookies
 
     Raises:
-        DownloadError: Si el botón no se encuentra o la descarga falla.
+        DownloadError: Si todas las estrategias fallan.
     """
+    # ── Estrategia 0: DOM scraping (no requiere click) ───────────────────────────
+    dom_result = await _extract_claves_from_dom(page, dest)
+    if dom_result is not None:
+        return dom_result
+
+    log.info("dom_strategy_no_claves_trying_download_button")
+
     download_selectors = [
         "a:has-text('Descargar reporte')",
         "a:has-text('Descargar')",
@@ -595,9 +719,84 @@ async def _do_download(
             f"Screenshot: {screenshot_path}"
         )
 
-    # ── Estrategia 1: evento nativo de descarga (Content-Disposition: attachment) ──
+    # Loguear atributos del botón para diagnóstico
     try:
-        async with page.expect_download(timeout=30_000) as dl_info:
+        btn_href = await download_btn.get_attribute("href")
+        btn_onclick = await download_btn.get_attribute("onclick")
+        btn_id = await download_btn.get_attribute("id")
+        log.debug("download_btn_attrs", href=btn_href, onclick=btn_onclick, id=btn_id)
+    except Exception:
+        btn_href = None
+
+    # URLs de monitoreo/beacon a ignorar (Dynatrace, analytics)
+    _BEACON_PATTERNS = ("rb_bf", "dynatrace", "/beacon", "analytics", "tracking")
+
+    # ── Estrategia 1: evento nativo de descarga (Content-Disposition: attachment) ──
+    # Simultáneamente interceptamos toda respuesta real del portal SRI
+    captured_responses: list[bytes] = []
+    all_sri_responses: list[dict] = []  # Debug: todas las respuestas SRI
+    popup_pages: list = []
+
+    async def _on_response(response):
+        """Captura respuestas reales descargables del portal SRI."""
+        try:
+            url = response.url
+            ct = response.headers.get("content-type", "")
+            cd = response.headers.get("content-disposition", "")
+            status = response.status
+
+            # Solo nos interesan respuestas de SRI
+            if "srienlinea.sri.gob.ec" not in url:
+                return
+
+            # Guardar para debug (todas las respuestas SRI)
+            all_sri_responses.append({
+                "url": url[-100:],
+                "status": status,
+                "ct": ct[:60],
+                "cd": cd[:60],
+            })
+
+            # Saltar beacons conocidos de monitoreo
+            if any(p in url for p in _BEACON_PATTERNS):
+                return
+
+            # Criterios para capturar como descarga real:
+            is_attachment = "attachment" in cd
+            # text/plain de más de 100 bytes que NO sea beacon
+            is_large_text = "text/plain" in ct
+
+            if is_attachment or is_large_text or "octet-stream" in ct:
+                body = await response.body()
+                # Validar que sea contenido de texto (no JSON de beacon)
+                if body and len(body) > 100:
+                    # Verificar que NO sea JSON (beacon) ni binary corto
+                    try:
+                        preview = body[:50].decode("utf-8", errors="replace")
+                    except Exception:
+                        preview = ""
+                    if preview.startswith("{") or preview.startswith("<"):
+                        # JSON o HTML — no es el TXT
+                        log.debug("response_skipped_not_txt", url=url[-60:], preview=preview[:30])
+                        return
+                    captured_responses.append(body)
+                    log.debug("response_captured", url=url[-80:], ct=ct, cd=cd, size=len(body))
+                elif body and len(body) > 0 and is_attachment:
+                    # Cualquier adjunto, aunque pequeño
+                    captured_responses.append(body)
+                    log.debug("response_captured_attachment", url=url[-80:], size=len(body))
+        except Exception:
+            pass
+
+    async def _on_popup(popup_page):
+        popup_pages.append(popup_page)
+        log.debug("popup_detected", url=popup_page.url)
+
+    page.on("response", _on_response)
+    page.context.on("page", _on_popup)
+
+    try:
+        async with page.expect_download(timeout=25_000) as dl_info:
             await download_btn.click()
 
         download = await dl_info.value
@@ -607,36 +806,180 @@ async def _do_download(
         if dest.exists() and dest.stat().st_size > 0:
             log.info("download_saved", path=str(dest), size_bytes=dest.stat().st_size)
             return dest
-        raise DownloadError(f"Archivo vacío: {dest}")
 
     except PlaywrightTimeoutError:
-        log.warning("download_event_timeout_30s", note="probando estrategia de navegación")
+        log.warning("download_event_timeout_25s", note="probando interceptación HTTP")
+        # Loguear todas las respuestas SRI vistas (diagnóstico)
+        for r in all_sri_responses[-20:]:
+            log.debug("sri_response_seen", **r)
 
-    # ── Estrategia 2: el link navega a una URL con el TXT directamente ──────────
+    finally:
+        page.remove_listener("response", _on_response)
+        page.context.remove_listener("page", _on_popup)
+
+    # ── Estrategia 2: respuesta HTTP interceptada ya capturada ───────────────────
+    if captured_responses:
+        dest.write_bytes(captured_responses[0])
+        if dest.stat().st_size > 0:
+            log.info("download_via_interception", path=str(dest), size_bytes=dest.stat().st_size)
+            return dest
+
+    # ── Estrategia 3: esperar más sin re-click (la respuesta puede venir tarde) ──
+    log.info("download_waiting_extra_10s")
+    extra_captured: list[bytes] = []
+
+    async def _on_response_late(response):
+        try:
+            url = response.url
+            ct = response.headers.get("content-type", "")
+            cd = response.headers.get("content-disposition", "")
+            if "srienlinea.sri.gob.ec" not in url:
+                return
+            if any(p in url for p in _BEACON_PATTERNS):
+                return
+            if "attachment" in cd or ("text/plain" in ct and "octet-stream" not in ct):
+                body = await response.body()
+                if body and len(body) > 100:
+                    preview = body[:50].decode("utf-8", errors="replace")
+                    if not preview.startswith("{") and not preview.startswith("<"):
+                        extra_captured.append(body)
+                        log.debug("late_response_captured", url=url[-80:], size=len(body))
+        except Exception:
+            pass
+
+    page.on("response", _on_response_late)
+    await page.wait_for_timeout(10_000)
+    page.remove_listener("response", _on_response_late)
+
+    if extra_captured:
+        dest.write_bytes(extra_captured[0])
+        if dest.stat().st_size > 0:
+            log.info("download_via_late_interception", path=str(dest), size_bytes=dest.stat().st_size)
+            return dest
+
+    # ── Estrategia 4: popup / nueva pestaña ──────────────────────────────────────
+    if popup_pages:
+        popup = popup_pages[0]
+        try:
+            await popup.wait_for_load_state("domcontentloaded", timeout=10_000)
+            popup_content = await popup.content()
+            if popup_content and "<html" not in popup_content[:100].lower():
+                dest.write_text(popup_content, encoding="utf-8")
+                if dest.stat().st_size > 0:
+                    log.info("download_via_popup", path=str(dest))
+                    await popup.close()
+                    return dest
+            try:
+                async with popup.expect_download(timeout=5_000) as dl_info2:
+                    pass
+                dl2 = await dl_info2.value
+                await dl2.save_as(str(dest))
+                if dest.exists() and dest.stat().st_size > 0:
+                    log.info("download_via_popup_dl", path=str(dest))
+                    await popup.close()
+                    return dest
+            except PlaywrightTimeoutError:
+                pass
+            await popup.close()
+        except Exception as e:
+            log.warning("popup_strategy_failed", error=str(e))
+
+    # ── Estrategia 5: interceptar POST JSF via page.route() ──────────────────────
+    # mojarra.jsfcljs envía un POST al URL .jsf actual.
+    # Interceptamos esa respuesta y la guardamos directamente.
+    log.info("download_trying_jsf_route_intercept")
+    jsf_bodies: list[bytes] = []
+    jsf_debug: list[dict] = []
+
+    async def _catch_jsf(route, request):
+        try:
+            response = await route.fetch()
+            ct = response.headers.get("content-type", "")
+            cd = response.headers.get("content-disposition", "")
+            body = await response.body()
+            preview = body[:120].decode("utf-8", errors="replace") if body else ""
+            jsf_debug.append({
+                "method": request.method,
+                "url": request.url[-80:],
+                "status": response.status,
+                "ct": ct[:60],
+                "cd": cd[:60],
+                "size": len(body),
+                "preview": preview[:80],
+            })
+            # Capturar si es el archivo real: adjunto, o texto plano no-JSON >100 bytes
+            # NOTA: NO chequeamos "No existen datos" en el HTML porque esa cadena
+            # aparece como template JS incluso cuando SÍ hay resultados (falso positivo).
+            if "attachment" in cd:
+                jsf_bodies.append(body)
+            elif "text/plain" in ct and len(body) > 100 and not preview.strip().startswith("{"):
+                jsf_bodies.append(body)
+            await route.fulfill(response=response)
+        except Exception as e:
+            log.warning("jsf_route_catch_error", error=str(e))
+            await route.continue_()
+
     try:
-        pre_url = page.url
-        async with page.expect_navigation(timeout=30_000):
-            await download_btn.click()
+        await page.route("**/*.jsf", _catch_jsf)
+        await download_btn.click()
+        await page.wait_for_timeout(12_000)
+    finally:
+        try:
+            await page.unroute("**/*.jsf", _catch_jsf)
+        except Exception:
+            pass
 
-        post_url = page.url
-        log.debug("post_download_url", from_url=pre_url, to_url=post_url)
+    for entry in jsf_debug:
+        log.debug("jsf_route_response", **entry)
 
-        content = await page.content()
-        if content and "<html" not in content[:200].lower():
-            dest.write_text(content, encoding="utf-8")
-            if dest.stat().st_size > 0:
-                log.info("download_from_navigation", path=str(dest))
-                return dest
+    if jsf_bodies:
+        body_to_use = jsf_bodies[-1]
+        if body_to_use == b"__EMPTY__":
+            log.info("download_jsf_confirmed_empty")
+            return None  # Sin datos → tratar como "no comprobantes"
+        dest.write_bytes(body_to_use)
+        if dest.stat().st_size > 0:
+            log.info("download_via_jsf_route", path=str(dest), size_bytes=dest.stat().st_size)
+            return dest
 
-    except PlaywrightTimeoutError:
-        log.warning("navigation_strategy_timeout")
-    except Exception as e:
-        log.warning("navigation_strategy_failed", error=str(e))
+    # ── Estrategia 6: fetch directo con httpx + cookies (fallback si href real) ──
+    if btn_href and btn_href.startswith("http"):
+        log.info("download_trying_direct_fetch", href=btn_href)
+        try:
+            cookies_list = await page.context.cookies()
+            cookies_dict = {c["name"]: c["value"] for c in cookies_list}
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Referer": page.url,
+                "Accept": "text/plain,*/*",
+            }
+            async with httpx.AsyncClient(
+                cookies=cookies_dict,
+                headers=headers,
+                follow_redirects=True,
+                timeout=30.0,
+            ) as client:
+                resp = await client.get(btn_href)
+                if resp.status_code == 200 and resp.content:
+                    dest.write_bytes(resp.content)
+                    if dest.stat().st_size > 0:
+                        log.info(
+                            "download_via_direct_fetch",
+                            path=str(dest),
+                            size_bytes=dest.stat().st_size,
+                        )
+                        return dest
+        except Exception as e:
+            log.warning("direct_fetch_failed", error=str(e))
 
     # ── Diagnóstico final ──────────────────────────────────────────────────────
     screenshot_path = str(config.logs_dir / "download_timeout.png")
     await page.screenshot(path=screenshot_path, full_page=True)
     raise DownloadError(
-        f"No se pudo capturar la descarga del TXT tras dos estrategias. "
+        f"No se pudo capturar la descarga del TXT tras siete estrategias (DOM+6). "
         f"Screenshot: {screenshot_path}"
     )
