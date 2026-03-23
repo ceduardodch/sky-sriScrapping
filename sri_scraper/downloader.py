@@ -685,6 +685,21 @@ async def _do_download(
     if dom_result is not None:
         return dom_result
 
+    # El AJAX de Consultar puede tardar más que el wait inicial en _download_for_tipo.
+    # Esperamos hasta 15 s adicionales para que el portal muestre los resultados
+    # o el banner de "sin datos". Revisamos cada 3 s.
+    log.info("dom_no_claves_waiting_ajax_settle")
+    for _wait_round in range(5):
+        await page.wait_for_timeout(3_000)
+        # Intentar extracción de nuevo (puede aparecer la tabla con retraso)
+        dom_result = await _extract_claves_from_dom(page, dest)
+        if dom_result is not None:
+            return dom_result
+        # Si el portal ya muestra mensaje visible de "sin datos" → salir limpio
+        if await _is_empty_result(page):
+            log.info("download_empty_confirmed_after_ajax_wait", round=_wait_round + 1)
+            return None
+
     log.info("dom_strategy_no_claves_trying_download_button")
 
     download_selectors = [
@@ -977,9 +992,16 @@ async def _do_download(
             log.warning("direct_fetch_failed", error=str(e))
 
     # ── Diagnóstico final ──────────────────────────────────────────────────────
+    # Si el DOM tampoco tenía claves (estrategia 0 falló), lo más probable
+    # es que este tipo de comprobante realmente no tenga datos para la fecha
+    # consultada (el portal no muestra mensaje visible cuando el AJAX devuelve
+    # 0 resultados para un tipo específico).
+    # Retornar None permite que el bucle de tipos continúe con el siguiente.
     screenshot_path = str(config.logs_dir / "download_timeout.png")
     await page.screenshot(path=screenshot_path, full_page=True)
-    raise DownloadError(
-        f"No se pudo capturar la descarga del TXT tras siete estrategias (DOM+6). "
-        f"Screenshot: {screenshot_path}"
+    log.warning(
+        "download_all_strategies_failed",
+        note="tratando como tipo sin comprobantes para esta fecha",
+        screenshot=screenshot_path,
     )
+    return None
