@@ -51,6 +51,7 @@ services:
       ADMIN_API_KEY: ${ADMIN_API_KEY}
       FERNET_KEY: ${FERNET_KEY}
       INTERNAL_API_URL: http://api:8000
+      TWOCAPTCHA_API_KEY: ${TWOCAPTCHA_API_KEY}
     depends_on:
       db:
         condition: service_healthy
