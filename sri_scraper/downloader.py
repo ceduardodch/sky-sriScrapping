@@ -723,6 +723,14 @@ async def _do_download(
             log.info("download_empty_confirmed_after_ajax_wait", round=_wait_round + 1)
             return None
 
+    # Espera final de 8s antes de buscar el botón de descarga.
+    # El banner "No existen datos para los parámetros ingresados" puede tardar
+    # hasta 25s en aparecer — si se detecta ahora evitamos los ~60s de botón.
+    await page.wait_for_timeout(8_000)
+    if await _is_empty_result(page):
+        log.info("download_empty_confirmed_pre_button")
+        return None
+
     log.info("dom_strategy_no_claves_trying_download_button")
 
     download_selectors = [
