@@ -96,9 +96,22 @@ async def download_report(page: Page, config: SRIConfig) -> Optional[Path]:
     header_written = False
     total_rows = 0
 
-    for tipo_val, tipo_label in tipo_options:
+    # Guardar URL de comprobantes para recargar entre tipos y limpiar estado CAPTCHA
+    comprobantes_url = page.url
+
+    for tipo_idx, (tipo_val, tipo_label) in enumerate(tipo_options):
         slug = tipo_label.lower().replace(" ", "_").replace("/", "-").replace("\\", "-")
         temp_dest = config.downloads_dir / f"sri_recibidos_{target_date.strftime('%Y%m%d')}_{slug}.txt"
+
+        # A partir del segundo tipo, recargar la página para limpiar mensajes
+        # de error de CAPTCHA que persisten del tipo anterior en el DOM de JSF.
+        if tipo_idx > 0:
+            log.info("page_reload_between_tipos", tipo=tipo_label)
+            try:
+                await page.goto(comprobantes_url, wait_until="domcontentloaded", timeout=15_000)
+                await human_delay(1000, 2000)
+            except Exception as e:
+                log.warning("page_reload_failed", error=str(e))
 
         # Re-establecer período (JSF puede resets parciales entre consultas)
         await _set_periodo_selects(page, target_date)
@@ -345,7 +358,17 @@ async def _solve_recaptcha_2captcha(page_url: str, api_key: str) -> Optional[str
                     "https://api.2captcha.com/getTaskResult",
                     json={"clientKey": api_key, "taskId": task_id},
                 )
-            result = resp.json()
+            try:
+                result = resp.json()
+            except Exception:
+                # A veces la API devuelve JSON con trailing bytes — parsear manualmente
+                import json as _json
+                raw_text = resp.text.strip()
+                try:
+                    result = _json.loads(raw_text)
+                except Exception:
+                    log.warning("2captcha_json_parse_error", raw=raw_text[:80])
+                    continue
             status = result.get("status")
             if status == "ready":
                 token = result["solution"]["gRecaptchaResponse"]
