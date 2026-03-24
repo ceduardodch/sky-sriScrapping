@@ -673,6 +673,30 @@ async def _extract_claves_from_dom(page: Page, dest: Path) -> Optional[Path]:
             return dest
 
         log.info("dom_extraction_no_claves_in_page")
+
+        # ── Diagnóstico: guardar HTML completo y estadísticas para entender
+        # por qué no se encontraron claves (solo en primera llamada = no en loop).
+        # El archivo se llama debug_dom_<tipo_slug>.html en logs_dir.
+        try:
+            debug_path = dest.parent.parent / "logs" / f"debug_dom_{dest.stem}.html"
+            # Guardar máx 200KB para no saturar disco
+            debug_path.write_text(content[:200_000], encoding="utf-8", errors="replace")
+            # Buscar secuencias de dígitos largas (>10) para ver si hay claves parciales
+            import re as _re
+            long_digits = _re.findall(r"\d{10,}", content)
+            # Contar cuántos tiene la tabla innerText
+            table_digits = _re.findall(r"\d{10,}", table_text)
+            log.debug(
+                "dom_debug_info",
+                html_size=len(content),
+                long_digit_seqs_html=len(long_digits),
+                long_digit_seqs_table=len(table_digits),
+                sample_long=long_digits[:3] if long_digits else [],
+                debug_html=str(debug_path),
+            )
+        except Exception:
+            pass
+
         return None
 
     except Exception as e:
