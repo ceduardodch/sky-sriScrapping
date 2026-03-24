@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -72,8 +72,18 @@ class SRIConfig(BaseSettings):
 
     @property
     def effective_report_date(self) -> date:
-        """Retorna la fecha configurada o ayer si no se especificó."""
-        return self.report_date or (date.today() - timedelta(days=1))
+        """Retorna la fecha configurada o ayer en hora de Ecuador (America/Guayaquil = UTC-5).
+
+        El contenedor Docker corre en UTC. Sin esta corrección, a las 01:00 UTC
+        (= 20:00 Ecuador) 'ayer UTC' sería el día de hoy Ecuador, descargando
+        el día incorrecto.
+        """
+        if self.report_date:
+            return self.report_date
+        # Hora actual en Ecuador (UTC-5, sin cambio de horario de verano)
+        ecuador_tz = timezone(timedelta(hours=-5))
+        today_ec = datetime.now(ecuador_tz).date()
+        return today_ec - timedelta(days=1)
 
     def ensure_dirs(self) -> None:
         """Crea los directorios de runtime si no existen."""
