@@ -540,29 +540,30 @@ async def _is_empty_result(page: Page) -> bool:
     - No hay tabla de resultados con filas de datos (RichFaces / tabla JSF)
     - El CAPTCHA sigue fallando
     """
-    empty_texts = [
-        "No se encontraron resultados",
-        "No existen comprobantes",
-        "No hay comprobantes",
+    # ── Verificación robusta via JS (innerText solo incluye texto visible) ───────
+    # Usamos JS en lugar de Playwright locators para evitar problemas con
+    # tildes/acentos (á, é, ó) que confunden el selector `text=`.
+    empty_keywords = [
+        "no se encontraron resultados",
+        "no existen comprobantes",
+        "no hay comprobantes",
         "sin registros",
         "0 registros",
-        "No existen resultados",
+        "no existen resultados",
         "no se encontraron",
-        "No existe informaci",   # "No existe información para..."
-        "no existe inform",
-        "Sin resultados",
-        "No existen datos para los par",  # "No existen datos para los parámetros ingresados"
+        "no existe informaci",
+        "sin resultados",
+        "no existen datos para los par",   # "No existen datos para los parámetros"
         "no existen datos",
     ]
-
-    for text in empty_texts:
-        try:
-            el = page.locator(f"text={text}").first
-            if await el.is_visible(timeout=2_000):
-                log.debug("empty_result_detected", text=text)
+    try:
+        visible_text: str = await page.evaluate("() => document.body.innerText.toLowerCase()")
+        for kw in empty_keywords:
+            if kw in visible_text:
+                log.info("empty_result_detected_js", keyword=kw)
                 return True
-        except PlaywrightTimeoutError:
-            continue
+    except Exception:
+        pass
 
     # Si el CAPTCHA sigue fallando después del retry, tratar como vacío
     captcha_error_selectors = [
