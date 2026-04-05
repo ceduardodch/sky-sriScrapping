@@ -14,10 +14,10 @@ if config.config_file_name is not None:
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.database import Base
+from app.database import ControlBase, DataBase
 from app.models import Tenant, Comprobante, ScrapeLog  # noqa: F401
 
-target_metadata = Base.metadata
+target_metadata = [ControlBase.metadata, DataBase.metadata]
 
 # Allow DATABASE_URL env var to override alembic.ini
 import os as _os

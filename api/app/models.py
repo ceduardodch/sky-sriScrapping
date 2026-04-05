@@ -1,19 +1,33 @@
 from __future__ import annotations
+import enum
 
 from datetime import date, datetime
 
 from sqlalchemy import (
-    BigInteger, Boolean, Date, DateTime, ForeignKey,
-    Integer, Numeric, String, Text, UniqueConstraint,
+    BigInteger,
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
     func,
 )
+from sqlalchemy import JSON as SAJSON
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from .database import Base
+from .database import ControlBase, DataBase
+
+_JSON_DETAILS = SAJSON().with_variant(JSONB, "postgresql")
+_BIGINT_PK = BigInteger().with_variant(Integer, "sqlite")
 
 
-class Tenant(Base):
+class Tenant(ControlBase):
     __tablename__ = "tenants"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -23,20 +37,30 @@ class Tenant(Base):
     api_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     ambiente: Mapped[str] = mapped_column(String(20), default="PRODUCCION")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    storage_key: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="default",
+        server_default="default",
+    )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
+        DateTime(timezone=True),
+        server_default=func.now(),
     )
 
-    comprobantes: Mapped[list[Comprobante]] = relationship(back_populates="tenant")
     scrape_logs: Mapped[list[ScrapeLog]] = relationship(back_populates="tenant")
 
 
-class Comprobante(Base):
+class Comprobante(DataBase):
     __tablename__ = "comprobantes"
-    __table_args__ = (UniqueConstraint("tenant_id", "clave_acceso"),)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "clave_acceso", name="uq_tenant_clave"),
+        Index("ix_comprobantes_tenant_fecha", "tenant_id", "fecha_emision"),
+        Index("ix_comprobantes_ruc_emisor", "tenant_id", "ruc_emisor"),
+    )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    id: Mapped[int] = mapped_column(_BIGINT_PK, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[int] = mapped_column(Integer, nullable=False)
 
     # Identificación SRI
     clave_acceso: Mapped[str] = mapped_column(String(49), nullable=False)
@@ -68,27 +92,34 @@ class Comprobante(Base):
     importe_total: Mapped[float | None] = mapped_column(Numeric(12, 4))
 
     # Detalles (líneas de la factura)
-    detalles: Mapped[list | None] = mapped_column(JSONB)
+    detalles: Mapped[list | None] = mapped_column(_JSON_DETAILS)
 
     # XML original
     xml_raw: Mapped[str | None] = mapped_column(Text)
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
+        DateTime(timezone=True),
+        server_default=func.now(),
     )
 
-    tenant: Mapped[Tenant] = relationship(back_populates="comprobantes")
 
 
-class ScrapeLog(Base):
+
+class ScrapeLogStatus(str, enum.Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+class ScrapeLog(ControlBase):
     __tablename__ = "scrape_logs"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(_BIGINT_PK, primary_key=True, autoincrement=True)
     tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), nullable=False)
     fecha_reporte: Mapped[date | None] = mapped_column(Date)
     status: Mapped[str] = mapped_column(String(20), default="running")
     started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
+        DateTime(timezone=True),
+        server_default=func.now(),
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     comprobantes_nuevos: Mapped[int] = mapped_column(Integer, default=0)

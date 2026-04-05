@@ -21,6 +21,10 @@ class DownloadError(SRIScraperError):
     """La descarga del reporte TXT no pudo completarse."""
 
 
+class CaptchaChallengeError(DownloadError):
+    """El portal rechazó la consulta por CAPTCHA y la respuesta no es confiable."""
+
+
 class ParseError(SRIScraperError):
     """El archivo TXT descargado no pudo parsearse."""
 

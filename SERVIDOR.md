@@ -177,6 +177,123 @@ DOCKER_HOST=unix:///var/run/docker.sock /usr/bin/docker run -d \
 
 ---
 
+## Host nativo (staging paralelo en `192.168.1.12`)
+
+La preparación nativa deja:
+
+- PostgreSQL nativo en `127.0.0.1:15432`
+- API nativa en `http://127.0.0.1:18000`
+- Worker nativo instalado vía `systemd`, pero deshabilitado hasta validar manualmente
+- Chrome real instalado en el host para Patchright (`BROWSER_CHANNEL=chrome`)
+
+### 1. Bootstrap del host
+
+```bash
+ssh b2b@192.168.1.12
+cd ~/apps/sky-sriScrapping
+bash deploy/native/bootstrap_native_host.sh
+```
+
+Esto instala Chrome, Xvfb, PostgreSQL, crea `.venv-native/` y registra:
+
+- `sky-sri-api.service`
+- `sky-sri-worker.service`
+
+### 2. Levantar PostgreSQL nativo + restaurar datos + arrancar API nativa
+
+```bash
+ssh b2b@192.168.1.12
+cd ~/apps/sky-sriScrapping
+bash deploy/native/setup_native_postgres.sh
+```
+
+El script:
+
+- crea un cluster PostgreSQL nativo en `15432`
+- restaura un dump lógico desde `sky-sriscrapping-db-1`
+- actualiza `.env` con `DATABASE_URL`, `INTERNAL_API_URL`, `BROWSER_CHANNEL` y `WORKER_RUNTIME_ROOT`
+- ejecuta `alembic upgrade head`
+- arranca la API nativa en `18000`
+
+### 3. Parar solo el worker Docker mientras validas
+
+```bash
+ssh b2b@192.168.1.12
+DOCKER_HOST=unix:///var/run/docker.sock /usr/bin/docker stop sky-sriscrapping-worker-1
+```
+
+Para reactivarlo:
+
+```bash
+DOCKER_HOST=unix:///var/run/docker.sock /usr/bin/docker start sky-sriscrapping-worker-1
+```
+
+### 4. Prueba manual A/B del scraper nativo
+
+Con solver:
+
+```bash
+ssh b2b@192.168.1.12
+cd ~/apps/sky-sriScrapping
+source .venv-native/bin/activate
+REPORT_DATE=2026-03-22 python -m api.app.worker --tenant-id 1 --once
+```
+
+Sin solver:
+
+```bash
+ssh b2b@192.168.1.12
+cd ~/apps/sky-sriScrapping
+source .venv-native/bin/activate
+TWOCAPTCHA_API_KEY= REPORT_DATE=2026-03-22 python -m api.app.worker --tenant-id 1 --once
+```
+
+Si todavía no tienes una `KNOWN_GOOD_DATE`, usa una fecha reciente solo para validar navegación, `Consultar` y artefactos.
+
+### 5. Dónde quedan los artefactos
+
+```bash
+~/apps/sky-sriScrapping/runtime/tenant_1/logs/<timestamp>/
+~/apps/sky-sriScrapping/runtime/tenant_1/downloads/<timestamp>/
+~/apps/sky-sriScrapping/runtime/tenant_1/state/
+```
+
+Ahora cada corrida guarda por tipo y etapa:
+
+- screenshot post-consulta
+- HTML completo
+- `innerText`
+- metadata JSON con clasificación (`dom_missing_claves`, `empty_result_detected_*`, `download_all_strategies_failed`, etc.)
+- respuestas JSF interceptadas y su resumen JSON
+
+### 6. Logs de systemd
+
+```bash
+sudo journalctl -u sky-sri-api.service -f
+sudo journalctl -u sky-sri-worker.service -f
+```
+
+### 7. Cutover / rollback
+
+Mientras API/DB Docker siguen arriba, la validación nativa corre en paralelo (`18000` / `15432`).
+
+Cutover:
+
+```bash
+sudo systemctl stop sky-sri-api.service
+DOCKER_HOST=unix:///var/run/docker.sock /usr/bin/docker stop sky-sriscrapping-api-1 sky-sriscrapping-db-1
+# luego mover PostgreSQL nativo a 5432 y la API nativa a 8000
+```
+
+Rollback rápido:
+
+```bash
+sudo systemctl stop sky-sri-api.service sky-sri-worker.service
+DOCKER_HOST=unix:///var/run/docker.sock /usr/bin/docker start sky-sriscrapping-db-1 sky-sriscrapping-api-1 sky-sriscrapping-worker-1
+```
+
+---
+
 ## Seguridad recomendada (pendiente)
 
 ```bash

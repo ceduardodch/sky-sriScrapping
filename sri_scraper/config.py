@@ -9,12 +9,15 @@ from typing import Optional
 from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_ROOT_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+
 
 class SRIConfig(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_ROOT_ENV_FILE,
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",
         env_ignore_empty=True,  # Empty env vars treated as unset (use defaults)
     )
 
@@ -25,6 +28,8 @@ class SRIConfig(BaseSettings):
     # ── Browser ───────────────────────────────────────────────────────────────
     headless: bool = False
     browser_channel: str = "chrome"
+    browser_executable_path: Optional[Path] = None
+    browser_user_agent: Optional[str] = None
     locale: str = "es-EC"
     timezone: str = "America/Guayaquil"
     viewport_width: int = 1366

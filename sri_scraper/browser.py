@@ -18,6 +18,7 @@ from typing import AsyncIterator
 import structlog
 from patchright.async_api import (
     BrowserContext,
+    Page,
     async_playwright,
 )
 
@@ -90,29 +91,40 @@ async def browser_context(config: SRIConfig) -> AsyncIterator[BrowserContext]:
         "browser_launching",
         headless=config.headless,
         channel=config.browser_channel,
+        executable_path=str(config.browser_executable_path) if config.browser_executable_path else None,
         profile=str(profile_dir),
     )
 
     async with async_playwright() as pw:
-        context = await pw.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            channel=config.browser_channel,       # "chrome" → Chrome real instalado
-            headless=config.headless,
-            args=STEALTH_ARGS,
-            user_agent=USER_AGENT,
-            locale=config.locale,
-            timezone_id=config.timezone,
-            viewport={
+        launch_kwargs = {
+            "user_data_dir": str(profile_dir),
+            "headless": config.headless,
+            "args": STEALTH_ARGS,
+            "locale": config.locale,
+            "timezone_id": config.timezone,
+            "viewport": {
                 "width": config.viewport_width,
                 "height": config.viewport_height,
             },
-            accept_downloads=True,
-            downloads_path=str(config.downloads_dir),
+            "accept_downloads": True,
+            "downloads_path": str(config.downloads_dir),
             # Geolocalización de Ecuador para no levantar sospecha
-            geolocation={"latitude": -0.1807, "longitude": -78.4678},  # Quito
-            permissions=["geolocation"],
+            "geolocation": {"latitude": -0.1807, "longitude": -78.4678},  # Quito
+            "permissions": ["geolocation"],
             # No pasar extra_http_headers globales — el SRI los valida
-        )
+        }
+
+        if config.browser_user_agent:
+            launch_kwargs["user_agent"] = config.browser_user_agent
+
+        if config.browser_channel:
+            # "chrome" → Chrome real instalado en el host.
+            launch_kwargs["channel"] = config.browser_channel
+
+        if config.browser_executable_path:
+            launch_kwargs["executable_path"] = str(config.browser_executable_path)
+
+        context = await pw.chromium.launch_persistent_context(**launch_kwargs)
 
         log.info("browser_launched")
 
@@ -152,3 +164,27 @@ async def type_humanlike(element, text: str) -> None:
     await element.click()
     await human_delay(200, 500)
     await element.type(text, delay=random.randint(80, 160))
+
+
+async def human_page_dwell(page: Page, *, rounds: int = 2) -> None:
+    """
+    Simula exploración visual de la página con movimientos suaves y scroll corto.
+
+    Esto ayuda a que la sesión headed se parezca más a una navegación humana
+    antes de acciones sensibles como login o consultas con reCAPTCHA.
+    """
+    viewport = page.viewport_size or {"width": 1366, "height": 768}
+    width = max(320, viewport["width"])
+    height = max(240, viewport["height"])
+
+    for _ in range(rounds):
+        x = random.randint(80, max(81, width - 80))
+        y = random.randint(80, max(81, height - 80))
+        await page.mouse.move(x, y, steps=random.randint(12, 28))
+        await human_delay(250, 700)
+
+        scroll_y = random.randint(80, 260)
+        await page.mouse.wheel(0, scroll_y)
+        await human_delay(400, 900)
+        await page.mouse.wheel(0, -scroll_y)
+        await human_delay(300, 800)

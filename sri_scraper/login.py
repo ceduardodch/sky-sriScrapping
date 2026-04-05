@@ -12,7 +12,7 @@ import structlog
 from patchright.async_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from .browser import human_delay, type_humanlike
+from .browser import human_delay, human_page_dwell, type_humanlike
 from .config import SRIConfig
 from .exceptions import LoginError, MaintenanceError, SessionExpiredError
 
@@ -110,6 +110,7 @@ async def login(context: BrowserContext, config: SRIConfig) -> Page:
     # ── Paso 1: Navegar al portal ─────────────────────────────────────────────
     await _navigate_to_portal(page, config.page_timeout_ms)
     await human_delay(800, 1500)
+    await human_page_dwell(page, rounds=2)
 
     # ── Paso 2: Verificar mantenimiento ───────────────────────────────────────
     if await _is_maintenance(page, logs_dir=config.logs_dir):
@@ -144,9 +145,41 @@ async def login(context: BrowserContext, config: SRIConfig) -> Page:
             continue
 
     if ingresar_btn is None:
-        # Tal vez ya estamos en el formulario de login directamente
-        log.warning("ingresar_btn_not_found", url=page.url)
-    else:
+        # Sesión guardada expirada o portal redirigió a página inesperada.
+        # Limpiar cookies del contexto y reintentar desde cero.
+        log.warning("ingresar_btn_not_found_clearing_session", url=page.url)
+        await context.clear_cookies()
+
+        # También eliminar el auth_state.json guardado
+        import pathlib
+        auth_state_path = pathlib.Path(config.state_dir) / "auth_state.json"
+        try:
+            if auth_state_path.exists():
+                auth_state_path.unlink()
+                log.info("auth_state_cleared", path=str(auth_state_path))
+        except Exception:
+            pass
+
+        # Navegar de nuevo al portal con sesión limpia
+        await page.goto(SRI_BASE_URL, wait_until="domcontentloaded", timeout=config.page_timeout_ms)
+        await human_delay(1000, 2000)
+
+        for sel in selectors_ingresar:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=3_000):
+                    ingresar_btn = el
+                    log.debug("ingresar_btn_found_after_clear", selector=sel)
+                    break
+            except PlaywrightTimeoutError:
+                continue
+
+        if ingresar_btn is None:
+            log.warning("ingresar_btn_still_not_found", url=page.url)
+
+    if ingresar_btn is not None:
+        await ingresar_btn.hover()
+        await human_delay(300, 700)
         await ingresar_btn.click()
         await human_delay(1000, 2000)
 
@@ -238,6 +271,8 @@ async def login(context: BrowserContext, config: SRIConfig) -> Page:
             continue
 
     if submit_btn:
+        await submit_btn.hover()
+        await human_delay(300, 700)
         await submit_btn.click()
     else:
         # Fallback: Enter en el campo de contraseña

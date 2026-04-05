@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import settings
-from .database import get_session
+from .database import get_control_session
 from .models import Tenant
 
 _key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
@@ -30,7 +30,7 @@ async def verify_admin(api_key: str = Security(_key_header)) -> None:
 
 async def verify_tenant(
     api_key: str = Security(_key_header),
-    session: AsyncSession = Depends(get_session),
+    session: AsyncSession = Depends(get_control_session),
 ) -> Tenant:
     key_hash = _sha256(api_key)
     result = await session.execute(

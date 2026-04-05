@@ -1,0 +1,19 @@
+[Unit]
+Description=Sky SRI API (native host)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=b2b
+Group=b2b
+WorkingDirectory=/home/b2b/apps/sky-sriScrapping
+EnvironmentFile=/home/b2b/apps/sky-sriScrapping/.env
+Environment=PYTHONPATH=/home/b2b/apps/sky-sriScrapping
+Environment=API_PORT=18000
+ExecStart=/bin/bash -lc 'source /home/b2b/apps/sky-sriScrapping/.venv-native/bin/activate && cd /home/b2b/apps/sky-sriScrapping/api && alembic upgrade head && cd /home/b2b/apps/sky-sriScrapping && exec uvicorn api.app.main:app --host 0.0.0.0 --port "${API_PORT}"'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -28,23 +28,18 @@ from pathlib import Path
 from typing import Optional
 
 import click
-import structlog
 from rich.console import Console
 from rich.table import Table
 
-from sri_scraper.browser import browser_context
 from sri_scraper.config import SRIConfig
-from sri_scraper.downloader import download_report
 from sri_scraper.exceptions import (
     LoginError,
     MaintenanceError,
     NavigationError,
-    SessionExpiredError,
     SRIScraperError,
 )
-from sri_scraper.login import login
-from sri_scraper.navigator import go_to_comprobantes_recibidos
 from sri_scraper.parser import ClaveDeAcceso, extract_claves_from_file
+from sri_scraper.pipeline import scrape_recibidos
 from sri_scraper.soap_client import SRISOAPClient, save_xml
 
 console = Console(force_terminal=True, highlight=False)
@@ -149,65 +144,46 @@ def cmd_scrape(report_date: Optional[date], headless: bool) -> None:
 async def _run_pipeline(config: SRIConfig) -> None:
     """Ejecuta el pipeline completo de scraping."""
     try:
-        async with browser_context(config) as ctx:
-            console.print("[cyan]>> Paso 1/4:[/cyan] Iniciando sesion en el portal SRI...")
-            try:
-                page = await login(ctx, config)
-                console.print("[green]  [OK] Login exitoso[/green]")
-            except SessionExpiredError:
-                console.print("[yellow]  [~] Sesion expirada, intentando login fresco...[/yellow]")
-                # Limpiar cookies y reintentar
-                await ctx.clear_cookies()
-                page = await login(ctx, config)
-                console.print("[green]  [OK] Login exitoso (sesion renovada)[/green]")
+        console.print("[cyan]>> Paso 1/4:[/cyan] Ejecutando pipeline compartido del scraper...")
+        result = await scrape_recibidos(config)
 
-            console.print("[cyan]>> Paso 2/4:[/cyan] Navegando a Comprobantes Recibidos...")
-            await go_to_comprobantes_recibidos(page, config.page_timeout_ms)
-            console.print("[green]  [OK] Seccion encontrada[/green]")
-
+        if result.txt_path is None:
             console.print(
-                f"[cyan]>> Paso 3/4:[/cyan] Descargando reporte del "
-                f"{config.effective_report_date.strftime('%d/%m/%Y')}..."
+                f"[yellow]  [!] No hay comprobantes recibidos para el "
+                f"{config.effective_report_date.strftime('%d/%m/%Y')}[/yellow]"
             )
-            txt_path = await download_report(page, config)
+            return
 
-            if txt_path is None:
-                console.print(
-                    f"[yellow]  [!] No hay comprobantes recibidos para el "
-                    f"{config.effective_report_date.strftime('%d/%m/%Y')}[/yellow]"
-                )
-                return
+        console.print(f"[green]  [OK] TXT guardado: {result.txt_path}[/green]")
 
-            console.print(f"[green]  [OK] TXT guardado: {txt_path}[/green]")
+        console.print("[cyan]>> Paso 4/4:[/cyan] Parseando Claves de Acceso...")
+        claves = result.claves
+        console.print(f"[green]  [OK] {len(claves)} claves extraidas[/green]\n")
 
-            console.print("[cyan]>> Paso 4/4:[/cyan] Parseando Claves de Acceso...")
-            claves = extract_claves_from_file(txt_path)
-            console.print(f"[green]  [OK] {len(claves)} claves extraidas[/green]\n")
+        _print_claves_table(claves)
 
-            _print_claves_table(claves)
-
-            # Guardar claves en JSON para fases posteriores
-            import json
-            json_path = config.downloads_dir / f"claves_{config.effective_report_date.strftime('%Y%m%d')}.json"
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    [
-                        {
-                            "clave": c.raw,
-                            "tipo": c.tipo_comprobante_desc,
-                            "fecha": str(c.fecha_emision),
-                            "ruc_emisor": c.ruc_emisor,
-                            "numero": c.numero_completo,
-                            "ambiente": c.ambiente,
-                            "valida": c.is_valid,
-                        }
-                        for c in claves
-                    ],
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            console.print(f"\n[dim]Claves guardadas en JSON: {json_path}[/dim]")
+        # Guardar claves en JSON para fases posteriores
+        import json
+        json_path = config.downloads_dir / f"claves_{config.effective_report_date.strftime('%Y%m%d')}.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(
+                [
+                    {
+                        "clave": c.raw,
+                        "tipo": c.tipo_comprobante_desc,
+                        "fecha": str(c.fecha_emision),
+                        "ruc_emisor": c.ruc_emisor,
+                        "numero": c.numero_completo,
+                        "ambiente": c.ambiente,
+                        "valida": c.is_valid,
+                    }
+                    for c in claves
+                ],
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        console.print(f"\n[dim]Claves guardadas en JSON: {json_path}[/dim]")
 
     except MaintenanceError as e:
         console.print(f"[yellow][!] Portal SRI en mantenimiento:[/yellow] {e}")

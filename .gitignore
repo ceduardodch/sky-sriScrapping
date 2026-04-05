@@ -11,10 +11,12 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+.venv-native/
 venv/
 *.egg-info/
 dist/
 .pytest_cache/
+runtime/
 
 # Editor
 .vscode/

@@ -21,11 +21,18 @@ from typing import Optional
 
 import httpx
 import structlog
-from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
+from patchright.async_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
 
-from .browser import human_delay
+from .browser import USER_AGENT, human_delay, human_page_dwell
 from .config import SRIConfig
-from .exceptions import DownloadError
+from .diagnostics import (
+    artifact_stem,
+    classify_payload,
+    persist_binary_artifact,
+    write_json_artifact,
+    write_text_artifact,
+)
+from .exceptions import CaptchaChallengeError, DownloadError
 from .login import assert_authenticated
 
 log = structlog.get_logger(__name__)
@@ -113,13 +120,9 @@ async def download_report(page: Page, config: SRIConfig) -> Optional[Path]:
             except Exception as e:
                 log.warning("page_reload_failed", error=str(e))
 
-        # Re-establecer período (JSF puede resets parciales entre consultas)
-        await _set_periodo_selects(page, target_date)
-        await human_delay(200, 400)
-
-        # Seleccionar este tipo
-        await _select_tipo(page, tipo_val, tipo_label)
-        await human_delay(300, 500)
+            # Re-establecer período tras el reload (JSF puede resetear filtros).
+            await _set_periodo_selects(page, target_date)
+            await human_delay(200, 400)
 
         downloaded = await _download_for_tipo(
             page, config, target_date,
@@ -189,20 +192,240 @@ async def _get_tipo_options(page: Page) -> list[tuple[str, str]]:
     return result
 
 
-async def _select_tipo(page: Page, tipo_value: str, tipo_label: str) -> None:
-    """Selecciona el tipo de comprobante en el último select de la página."""
+def _is_jsf_post_response(response) -> bool:
+    """Reconoce postbacks JSF del módulo de comprobantes recibidos."""
+    try:
+        return (
+            "comprobantesRecibidos.jsf" in response.url
+            and response.request.method == "POST"
+        )
+    except Exception:
+        return False
+
+
+async def _read_select_state(select: Locator) -> dict[str, str]:
+    """Lee value + label seleccionados de un <select>."""
+    return await select.evaluate(
+        """
+        el => {
+            const opt = el.options[el.selectedIndex];
+            return {
+                value: el.value || '',
+                label: opt ? opt.text.trim() : '',
+            };
+        }
+        """
+    )
+
+
+async def _pick_periodo_selects(page: Page) -> tuple[Locator, Locator, Locator]:
+    """
+    Ubica los selects de año, mes y día.
+
+    Prefiere los IDs JSF estables del portal y cae al heurístico por contenido
+    solo si el DOM cambia.
+    """
+    direct_selectors = {
+        "year": "#frmPrincipal\\:ano",
+        "month": "#frmPrincipal\\:mes",
+        "day": "#frmPrincipal\\:dia",
+    }
+    located: dict[str, Locator] = {}
+    for key, selector in direct_selectors.items():
+        locator = page.locator(selector)
+        if await locator.count() > 0:
+            located[key] = locator.first
+
+    if len(located) == 3:
+        return located["year"], located["month"], located["day"]
+
+    selects = page.locator("select")
+    count = await selects.count()
+    year_idx = month_idx = day_idx = None
+
+    for i in range(count):
+        try:
+            html = await selects.nth(i).inner_html(timeout=2_000)
+        except Exception:
+            continue
+
+        if year_idx is None and ">2026<" in html:
+            year_idx = i
+        elif month_idx is None and "Enero" in html and "Diciembre" in html:
+            month_idx = i
+        elif day_idx is None and ">31<" in html and ">1<" in html:
+            day_idx = i
+
+    if year_idx is None:
+        year_idx = 0
+    if month_idx is None:
+        month_idx = 1
+    if day_idx is None:
+        day_idx = 2
+
+    return selects.nth(year_idx), selects.nth(month_idx), selects.nth(day_idx)
+
+
+async def _pick_tipo_select(page: Page) -> Locator:
+    """Ubica el select del tipo de comprobante."""
+    direct = page.locator("#frmPrincipal\\:cmbTipoComprobante")
+    if await direct.count() > 0:
+        return direct.first
+
     selects = page.locator("select")
     count = await selects.count()
     if count == 0:
+        raise DownloadError("No se encontró ningún select en la pantalla de consulta")
+    return selects.nth(count - 1)
+
+
+async def _select_option_stably(
+    page: Page,
+    select: Locator,
+    *,
+    field_name: str,
+    value: Optional[str] = None,
+    label: Optional[str] = None,
+    expect_jsf_post: bool = False,
+) -> dict[str, str]:
+    """
+    Selecciona una opción y espera el posible postback AJAX del portal.
+
+    RichFaces/JSF puede re-renderizar selects después de cambiar año/mes; por
+    eso esperamos el POST cuando aplica y luego leemos el estado final.
+    """
+    async def _apply() -> None:
+        if value is not None:
+            await select.select_option(value=value)
+        elif label is not None:
+            await select.select_option(label=label)
+        else:
+            raise ValueError("Se requiere value o label para seleccionar una opción")
+
+    response_status: Optional[int] = None
+    if expect_jsf_post:
+        try:
+            async with page.expect_response(_is_jsf_post_response, timeout=4_000) as info:
+                await _apply()
+            response = await info.value
+            response_status = response.status
+        except PlaywrightTimeoutError:
+            log.debug("select_option_no_jsf_post", field=field_name)
+        except Exception:
+            raise
+    else:
+        await _apply()
+
+    await human_delay(300, 600)
+    current = await _read_select_state(select)
+    log.debug(
+        "select_option_applied",
+        field=field_name,
+        requested_value=value,
+        requested_label=label,
+        response_status=response_status,
+        current=current,
+    )
+    return current
+
+
+async def _read_current_filters(page: Page) -> dict[str, str]:
+    """Lee el estado actual de filtros visibles del formulario JSF."""
+    current = {
+        "ruc_value": "",
+        "year_value": "",
+        "month_value": "",
+        "month_label": "",
+        "day_value": "",
+        "day_label": "",
+        "tipo_value": "",
+        "tipo_label": "",
+    }
+
+    try:
+        ruc_input = page.locator("#frmPrincipal\\:txtParametro")
+        if await ruc_input.count() > 0:
+            current["ruc_value"] = await ruc_input.first.input_value()
+    except Exception:
+        pass
+
+    try:
+        year_select, month_select, day_select = await _pick_periodo_selects(page)
+        year_state = await _read_select_state(year_select)
+        month_state = await _read_select_state(month_select)
+        day_state = await _read_select_state(day_select)
+        current["year_value"] = year_state["value"]
+        current["month_value"] = month_state["value"]
+        current["month_label"] = month_state["label"]
+        current["day_value"] = day_state["value"]
+        current["day_label"] = day_state["label"]
+    except Exception:
+        pass
+
+    try:
+        tipo_state = await _read_select_state(await _pick_tipo_select(page))
+        current["tipo_value"] = tipo_state["value"]
+        current["tipo_label"] = tipo_state["label"]
+    except Exception:
+        pass
+
+    return current
+
+
+def _filters_match_target_date(current: dict[str, str], target_date: date) -> bool:
+    """Retorna True si los filtros visibles ya apuntan a la fecha objetivo."""
+    return (
+        current.get("year_value") == str(target_date.year)
+        and current.get("month_label") == MESES_ES[target_date.month]
+        and current.get("day_value") == str(target_date.day)
+    )
+
+
+def _tipo_matches_current(current: dict[str, str], tipo_value: str, tipo_label: str) -> bool:
+    """Retorna True si el tipo visible ya coincide con el solicitado."""
+    current_value = current.get("tipo_value", "")
+    current_label = current.get("tipo_label", "")
+    if tipo_value and current_value == tipo_value:
+        return True
+    if tipo_label and current_label == tipo_label:
+        return True
+    return False
+
+
+async def _select_tipo(page: Page, tipo_value: str, tipo_label: str) -> None:
+    """Selecciona el tipo de comprobante en el último select de la página."""
+    current = await _read_current_filters(page)
+    if _tipo_matches_current(current, tipo_value, tipo_label):
+        log.debug("tipo_already_selected", value=tipo_value, label=tipo_label, current=current)
         return
 
-    tipo_select = selects.nth(count - 1)
     try:
-        if tipo_value:
-            await tipo_select.select_option(value=tipo_value)
-        else:
-            await tipo_select.select_option(label=tipo_label)
-        log.debug("tipo_selected", value=tipo_value, label=tipo_label)
+        for attempt in range(3):
+            tipo_select = await _pick_tipo_select(page)
+            current = await _select_option_stably(
+                page,
+                tipo_select,
+                field_name="tipo_comprobante",
+                value=tipo_value or None,
+                label=None if tipo_value else tipo_label,
+            )
+            if current["value"] == tipo_value or current["label"] == tipo_label:
+                log.debug(
+                    "tipo_selected",
+                    attempt=attempt + 1,
+                    value=tipo_value,
+                    label=tipo_label,
+                    current=current,
+                )
+                return
+            log.warning(
+                "tipo_selection_mismatch",
+                attempt=attempt + 1,
+                expected_value=tipo_value,
+                expected_label=tipo_label,
+                current=current,
+            )
+            await page.wait_for_timeout(1_000)
     except Exception as e:
         log.warning("tipo_select_failed", value=tipo_value, label=tipo_label, error=str(e))
 
@@ -221,28 +444,52 @@ async def _download_for_tipo(
     Returns:
         Path del TXT descargado, o None si no hay comprobantes.
     """
-    # Seleccionar tipo (si no es el predeterminado vacío)
-    if tipo_label != "default":
+    current_filters = await _read_current_filters(page)
+    if not _filters_match_target_date(current_filters, target_date):
+        log.warning("periodo_drift_detected_before_consultar", current=current_filters)
+        await _set_periodo_selects(page, target_date)
+        await human_delay(300, 500)
+        current_filters = await _read_current_filters(page)
+
+    if tipo_label != "default" and not _tipo_matches_current(current_filters, tipo_value, tipo_label):
         await _select_tipo(page, tipo_value, tipo_label)
         await human_delay(300, 500)
 
     # Consultar
-    await _click_consultar(page, config)
+    await _click_consultar(
+        page,
+        config,
+        target_date=target_date,
+        tipo_label=tipo_label,
+    )
     log.info("consultar_clicked", tipo=tipo_label)
 
     # Esperar AJAX (SRI tarda 5-15 s)
     await human_delay(6000, 10000)
 
-    # Screenshot diagnóstico (solo para el primer tipo o tipo único)
-    debug_shot = str(config.logs_dir / "download_debug_post_consultar.png")
-    await page.screenshot(path=debug_shot, full_page=True)
-    log.debug("post_consultar_screenshot", path=debug_shot, tipo=tipo_label)
+    artifacts = await _persist_page_artifacts(
+        page,
+        config,
+        target_date,
+        tipo_label,
+        stage="post_consultar",
+        classification="post_consultar_snapshot",
+    )
+    log.debug("post_consultar_screenshot", path=artifacts["screenshot"], tipo=tipo_label)
 
     if await _is_empty_result(page):
+        await _persist_page_artifacts(
+            page,
+            config,
+            target_date,
+            tipo_label,
+            stage="empty_result",
+            classification="empty_result_detected",
+        )
         log.info("no_comprobantes_for_tipo", tipo=tipo_label, date=str(target_date))
         return None
 
-    return await _do_download(page, config, dest)
+    return await _do_download(page, config, target_date, tipo_label, dest)
 
 
 async def _set_periodo_selects(page: Page, target_date: date) -> None:
@@ -260,58 +507,60 @@ async def _set_periodo_selects(page: Page, target_date: date) -> None:
     month_str = MESES_ES[target_date.month]
     day_str   = str(target_date.day)
 
-    selects = page.locator("select")
-    count = await selects.count()
-    log.debug("selects_found_on_page", count=count)
+    current = await _read_current_filters(page)
+    if _filters_match_target_date(current, target_date):
+        log.info("periodo_already_selected", current=current)
+        return
 
-    year_idx = month_idx = day_idx = None
-
-    for i in range(count):
+    for attempt in range(3):
         try:
-            html = await selects.nth(i).inner_html(timeout=2_000)
-        except Exception:
-            continue
+            year_select, month_select, day_select = await _pick_periodo_selects(page)
+            await _select_option_stably(
+                page,
+                year_select,
+                field_name="periodo_ano",
+                value=year_str,
+                expect_jsf_post=False,
+            )
+            await _select_option_stably(
+                page,
+                month_select,
+                field_name="periodo_mes",
+                label=month_str,
+                expect_jsf_post=True,
+            )
+            await page.wait_for_timeout(800)
+            year_select, month_select, day_select = await _pick_periodo_selects(page)
+            await _select_option_stably(
+                page,
+                day_select,
+                field_name="periodo_dia",
+                value=day_str,
+                expect_jsf_post=False,
+            )
+            await page.wait_for_timeout(1_000)
 
-        if year_idx is None and (
-            f">{year_str}<" in html
-            or f'"{year_str}"' in html
-            or f"'{year_str}'" in html
-        ):
-            year_idx = i
-        elif month_idx is None and month_str in html:
-            month_idx = i
-        elif day_idx is None and (
-            ">31<" in html or ">30<" in html
-        ) and month_str not in html and year_str not in html:
-            day_idx = i
+            current = await _read_current_filters(page)
+            if _filters_match_target_date(current, target_date):
+                log.info("periodo_selected_confirmed", attempt=attempt + 1, current=current)
+                return
 
-    if year_idx is None:
-        log.warning("year_select_not_detected_by_content", fallback=0)
-        year_idx = 0
-    if month_idx is None:
-        log.warning("month_select_not_detected_by_content", fallback=1)
-        month_idx = 1
-    if day_idx is None:
-        log.warning("day_select_not_detected_by_content", fallback=2)
-        day_idx = 2
+            log.warning(
+                "periodo_selection_mismatch",
+                attempt=attempt + 1,
+                expected={"year": year_str, "month": month_str, "day": day_str},
+                current=current,
+            )
+        except Exception as e:
+            log.warning("periodo_select_failed", attempt=attempt + 1, error=str(e))
 
-    try:
-        await selects.nth(year_idx).select_option(year_str)
-        log.debug("year_selected", idx=year_idx, value=year_str)
-    except Exception as e:
-        log.warning("year_select_failed", error=str(e))
+        await page.wait_for_timeout(1_500)
 
-    try:
-        await selects.nth(month_idx).select_option(label=month_str)
-        log.debug("month_selected", idx=month_idx, value=month_str)
-    except Exception as e:
-        log.warning("month_select_failed", error=str(e))
-
-    try:
-        await selects.nth(day_idx).select_option(day_str)
-        log.debug("day_selected", idx=day_idx, value=day_str)
-    except Exception as e:
-        log.warning("day_select_failed", error=str(e))
+    log.warning(
+        "periodo_selection_unconfirmed",
+        expected={"year": year_str, "month": month_str, "day": day_str},
+        current=await _read_current_filters(page),
+    )
 
 
 async def _solve_recaptcha_2captcha(page_url: str, api_key: str) -> Optional[str]:
@@ -326,60 +575,87 @@ async def _solve_recaptcha_2captcha(page_url: str, api_key: str) -> Optional[str
     """
     log.info("2captcha_solving_started", url=page_url, action=_RECAPTCHA_ACTION)
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            # 1) Crear tarea
-            resp = await client.post(
-                "https://api.2captcha.com/createTask",
-                json={
-                    "clientKey": api_key,
-                    "task": {
-                        "type": "RecaptchaV3TaskProxyless",
-                        "websiteURL": page_url,
-                        "websiteKey": _RECAPTCHA_SITE_KEY,
-                        "pageAction": _RECAPTCHA_ACTION,
-                        "isEnterprise": True,
-                        "minScore": 0.5,
-                    },
+        task_variants = [
+            (
+                "v2_enterprise_invisible",
+                {
+                    "type": "RecaptchaV2EnterpriseTaskProxyless",
+                    "websiteURL": page_url,
+                    "websiteKey": _RECAPTCHA_SITE_KEY,
+                    "isInvisible": True,
+                    "userAgent": USER_AGENT,
                 },
-            )
-        data = resp.json()
-        if data.get("errorId", 1) != 0:
-            log.warning("2captcha_create_failed", error=data.get("errorDescription"), code=data.get("errorCode"))
-            return None
+            ),
+            (
+                "v3_enterprise",
+                {
+                    "type": "RecaptchaV3TaskProxyless",
+                    "websiteURL": page_url,
+                    "websiteKey": _RECAPTCHA_SITE_KEY,
+                    "pageAction": _RECAPTCHA_ACTION,
+                    "isEnterprise": True,
+                    "minScore": 0.5,
+                },
+            ),
+        ]
 
-        task_id = data["taskId"]
-        log.info("2captcha_task_created", task_id=task_id)
-
-        # 2) Polling para resultado (máx 2 minutos)
-        for attempt in range(24):
-            await asyncio.sleep(5)
+        for variant_name, task_payload in task_variants:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
-                    "https://api.2captcha.com/getTaskResult",
-                    json={"clientKey": api_key, "taskId": task_id},
+                    "https://api.2captcha.com/createTask",
+                    json={
+                        "clientKey": api_key,
+                        "task": task_payload,
+                    },
                 )
-            try:
-                result = resp.json()
-            except Exception:
-                # A veces la API devuelve JSON con trailing bytes — parsear manualmente
-                import json as _json
-                raw_text = resp.text.strip()
-                try:
-                    result = _json.loads(raw_text)
-                except Exception:
-                    log.warning("2captcha_json_parse_error", raw=raw_text[:80])
-                    continue
-            status = result.get("status")
-            if status == "ready":
-                token = result["solution"]["gRecaptchaResponse"]
-                log.info("2captcha_solved", attempts=attempt + 1, token_prefix=token[:20])
-                return token
-            elif status == "processing":
-                log.debug("2captcha_still_processing", attempt=attempt + 1)
+            data = resp.json()
+            if data.get("errorId", 1) != 0:
+                log.warning(
+                    "2captcha_create_failed",
+                    variant=variant_name,
+                    error=data.get("errorDescription"),
+                    code=data.get("errorCode"),
+                )
                 continue
-            else:
-                log.warning("2captcha_unexpected_status", status=status, data=result)
-                return None
+
+            task_id = data["taskId"]
+            log.info("2captcha_task_created", task_id=task_id, variant=variant_name)
+
+            # Polling para resultado (máx 2 minutos)
+            for attempt in range(24):
+                await asyncio.sleep(5)
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.post(
+                        "https://api.2captcha.com/getTaskResult",
+                        json={"clientKey": api_key, "taskId": task_id},
+                    )
+                try:
+                    result = resp.json()
+                except Exception:
+                    # A veces la API devuelve JSON con trailing bytes — parsear manualmente
+                    import json as _json
+                    raw_text = resp.text.strip()
+                    try:
+                        result = _json.loads(raw_text)
+                    except Exception:
+                        log.warning("2captcha_json_parse_error", raw=raw_text[:80], variant=variant_name)
+                        continue
+                status = result.get("status")
+                if status == "ready":
+                    token = result["solution"]["gRecaptchaResponse"]
+                    log.info(
+                        "2captcha_solved",
+                        attempts=attempt + 1,
+                        token_prefix=token[:20],
+                        variant=variant_name,
+                    )
+                    return token
+                if status == "processing":
+                    log.debug("2captcha_still_processing", attempt=attempt + 1, variant=variant_name)
+                    continue
+
+                log.warning("2captcha_unexpected_status", status=status, data=result, variant=variant_name)
+                break
 
         log.warning("2captcha_timeout_2min")
         return None
@@ -391,27 +667,205 @@ async def _solve_recaptcha_2captcha(page_url: str, api_key: str) -> Optional[str
 
 async def _inject_and_submit_with_token(page: Page, token: str) -> None:
     """
-    Inyecta el token de reCAPTCHA en el campo oculto y dispara
-    onSubmit() directamente (bypasando el flujo normal de reCAPTCHA).
+    Inyecta el token de reCAPTCHA en el formulario y dispara el AJAX
+    JSF/PrimeFaces que usa el portal para consultar comprobantes.
+
+    El flujo del SRI define `rcBuscar()` con un `source` JSF dinámico
+    (`frmPrincipal:j_idtXX`). Llamar `onSubmit()` directamente resultó
+    inestable en automatización nativa; por eso extraemos el `source`
+    y ejecutamos `PrimeFaces.ab(...)` de forma explícita.
     """
+    def _is_jsf_post_response(response) -> bool:
+        return (
+            response.request.method == "POST"
+            and "comprobantesRecibidos.jsf" in response.url
+        )
+
+    async def _read_submit_meta() -> dict[str, object]:
+        raw_meta = await page.evaluate(
+            """
+            () => document.documentElement.getAttribute('data-codex-submit-meta')
+            """
+        )
+        if not raw_meta:
+            return {}
+
+        import json as _json
+
+        try:
+            parsed = _json.loads(raw_meta)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {"raw_meta": raw_meta}
+        return {}
+
     await page.evaluate(
         """
         (token) => {
-            // Rellenar todos los campos g-recaptcha-response de la página
-            document.querySelectorAll('[name="g-recaptcha-response"]').forEach(el => {
-                el.value = token;
-            });
-            // Llamar onSubmit() que internamente llama rcBuscar() → PrimeFaces AJAX
-            if (typeof onSubmit === 'function') {
-                onSubmit();
-            } else if (typeof rcBuscar === 'function') {
-                rcBuscar();
-            }
+            document.documentElement.removeAttribute('data-codex-submit-meta');
+            const tokenLiteral = JSON.stringify(token);
+            const script = document.createElement('script');
+            script.text = `
+                (function() {
+                    const token = ${tokenLiteral};
+                    const root = document.documentElement;
+
+                    const writeMeta = (meta) => {
+                        try {
+                            root.setAttribute('data-codex-submit-meta', JSON.stringify(meta));
+                        } catch (err) {
+                            root.setAttribute('data-codex-submit-meta', JSON.stringify({
+                                strategy: 'meta_write_failed',
+                                error: String(err),
+                            }));
+                        }
+                    };
+
+                    const fillTokenFields = () => {
+                        const fields = Array.from(
+                            document.querySelectorAll('[name="g-recaptcha-response"]')
+                        );
+                        fields.forEach((el) => {
+                            el.value = token;
+                            el.textContent = token;
+                            el.innerHTML = token;
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        });
+                        return fields.length;
+                    };
+
+                    const trySubmit = () => {
+                        const filled = fillTokenFields();
+                        const rcBuscarSource = typeof rcBuscar === 'function'
+                            ? String(rcBuscar)
+                            : '';
+                        const sourceMatch = rcBuscarSource.match(/source:'([^']+)'/);
+                        const updateMatch = rcBuscarSource.match(/update:'([^']+)'/);
+                        const source = sourceMatch ? sourceMatch[1] : null;
+                        const update = updateMatch ? updateMatch[1] : null;
+
+                        if (typeof onSubmit === 'function') {
+                            const btn = document.getElementById('frmPrincipal:btnBuscar');
+                            if (btn && typeof deshabilitarBoton === 'function') {
+                                deshabilitarBoton(btn);
+                            }
+                            onSubmit();
+                            writeMeta({
+                                strategy: 'onSubmit',
+                                filled,
+                                source,
+                                update,
+                                has_execute_recaptcha: typeof executeRecaptcha === 'function',
+                                has_on_submit: true,
+                                has_rc_buscar: false,
+                                has_primefaces: typeof PrimeFaces !== 'undefined'
+                                    && PrimeFaces
+                                    && typeof PrimeFaces.ab === 'function',
+                            });
+                            return true;
+                        }
+
+                        if (typeof rcBuscar === 'function') {
+                            const btn = document.getElementById('frmPrincipal:btnBuscar');
+                            if (btn && typeof deshabilitarBoton === 'function') {
+                                deshabilitarBoton(btn);
+                            }
+                            rcBuscar();
+                            writeMeta({
+                                strategy: 'rcBuscar_no_params',
+                                filled,
+                                source,
+                                update,
+                                has_execute_recaptcha: typeof executeRecaptcha === 'function',
+                                has_on_submit: typeof onSubmit === 'function',
+                                has_rc_buscar: true,
+                                has_primefaces: typeof PrimeFaces !== 'undefined'
+                                    && PrimeFaces
+                                    && typeof PrimeFaces.ab === 'function',
+                            });
+                            return true;
+                        }
+
+                        if (
+                            typeof PrimeFaces !== 'undefined'
+                            && PrimeFaces
+                            && typeof PrimeFaces.ab === 'function'
+                        ) {
+                            PrimeFaces.ab({
+                                source: source || 'frmPrincipal:btnBuscar',
+                                formId: 'frmPrincipal',
+                                process: '@all',
+                                update: update || undefined,
+                                params: [{ name: 'g-recaptcha-response', value: token }],
+                            });
+                            writeMeta({
+                                strategy: 'primefaces_ab',
+                                filled,
+                                source: source || 'frmPrincipal:btnBuscar',
+                                update,
+                                has_execute_recaptcha: typeof executeRecaptcha === 'function',
+                                has_on_submit: typeof onSubmit === 'function',
+                                has_rc_buscar: false,
+                                has_primefaces: true,
+                            });
+                            return true;
+                        }
+
+                        return false;
+                    };
+
+                    let attempts = 0;
+                    const timer = setInterval(() => {
+                        attempts += 1;
+                        if (trySubmit()) {
+                            clearInterval(timer);
+                            return;
+                        }
+
+                        if (attempts >= 40) {
+                            clearInterval(timer);
+                            writeMeta({
+                                strategy: 'no_handlers',
+                                attempts,
+                                has_execute_recaptcha: typeof executeRecaptcha === 'function',
+                                has_on_submit: typeof onSubmit === 'function',
+                                has_rc_buscar: typeof rcBuscar === 'function',
+                                has_primefaces: typeof PrimeFaces !== 'undefined'
+                                    && PrimeFaces
+                                    && typeof PrimeFaces.ab === 'function',
+                                rc_buscar_source: typeof rcBuscar === 'function' ? String(rcBuscar) : null,
+                            });
+                        }
+                    }, 500);
+                })();
+            `;
+            document.documentElement.appendChild(script);
+            script.remove();
         }
         """,
         token,
     )
-    log.info("2captcha_token_injected_and_submitted")
+
+    try:
+        async with page.expect_response(_is_jsf_post_response, timeout=20_000) as resp_info:
+            await human_delay(50, 150)
+        response = await resp_info.value
+        response_status = response.status
+    except PlaywrightTimeoutError:
+        submit_meta = await _read_submit_meta()
+        if not submit_meta:
+            submit_meta = {"strategy": "timeout_no_request"}
+        log.warning("2captcha_submit_no_jsf_response", **submit_meta)
+        return
+
+    submit_meta = await _read_submit_meta()
+    log.info(
+        "2captcha_token_injected_and_submitted",
+        response_status=response_status,
+        **submit_meta,
+    )
 
 
 async def _humanize_before_consultar(page: Page, config: Optional["SRIConfig"] = None) -> None:
@@ -419,6 +873,9 @@ async def _humanize_before_consultar(page: Page, config: Optional["SRIConfig"] =
     Simula comportamiento humano antes de hacer click en Consultar.
     Mejora el score de reCAPTCHA v3 Enterprise para el modo sin solver.
     """
+    rounds = 4 if config and not config.headless else 3
+    await human_page_dwell(page, rounds=rounds)
+
     # Scroll suave por la página
     await page.evaluate("window.scrollTo(0, 200)")
     await human_delay(400, 800)
@@ -433,11 +890,121 @@ async def _humanize_before_consultar(page: Page, config: Optional["SRIConfig"] =
     except Exception:
         pass
 
-    # Espera adicional para que reCAPTCHA Enterprise score la sesión
-    await human_delay(2000, 3500)
+    for selector in (
+        "#frmPrincipal\\:ano",
+        "#frmPrincipal\\:mes",
+        "#frmPrincipal\\:dia",
+        "#frmPrincipal\\:cmbTipoComprobante",
+        "#frmPrincipal\\:btnBuscar",
+    ):
+        try:
+            el = page.locator(selector).first
+            if await el.is_visible(timeout=1_500):
+                await el.hover()
+                await human_delay(250, 700)
+        except Exception:
+            continue
+
+    try:
+        await page.locator("body").click(position={"x": 120, "y": 120}, timeout=1_500)
+        await human_delay(500, 1100)
+    except Exception:
+        pass
+
+    # En modo headed damos más tiempo para que la sesión "madure" antes
+    # de accionar el botón sensible de consulta.
+    if config and not config.headless:
+        await human_delay(8000, 14000)
+    else:
+        await human_delay(4000, 7000)
 
 
-async def _click_consultar(page: Page, config: SRIConfig) -> None:
+async def _humanize_after_captcha_failure(
+    page: Page,
+    config: SRIConfig,
+    *,
+    attempt: int,
+) -> None:
+    """
+    Hace una pausa más creíble tras un captcha fallido.
+
+    Evita el patrón robótico de click-ear inmediatamente otra vez y mete
+    lectura/scroll/hover antes del siguiente intento.
+    """
+    await human_page_dwell(page, rounds=3 + attempt)
+
+    for selector in (
+        "#frmPrincipal\\:ano",
+        "#frmPrincipal\\:mes",
+        "#frmPrincipal\\:dia",
+        "#frmPrincipal\\:cmbTipoComprobante",
+        "#frmPrincipal\\:btnBuscar",
+    ):
+        try:
+            el = page.locator(selector).first
+            if await el.is_visible(timeout=1_500):
+                await el.hover()
+                await human_delay(250, 800)
+        except Exception:
+            continue
+
+    try:
+        await page.evaluate("window.scrollTo(0, 260)")
+        await human_delay(700, 1400)
+        await page.evaluate("window.scrollTo(0, 0)")
+        await human_delay(600, 1200)
+    except Exception:
+        pass
+
+    headed_ranges = [
+        (15000, 22000),
+        (26000, 36000),
+        (38000, 52000),
+    ]
+    headless_ranges = [
+        (10000, 15000),
+        (18000, 26000),
+        (26000, 34000),
+    ]
+    wait_ranges = headed_ranges if not config.headless else headless_ranges
+    low_ms, high_ms = wait_ranges[min(attempt, len(wait_ranges) - 1)]
+    log.info(
+        "consultar_retry_after_captcha",
+        attempt=attempt + 1,
+        wait_ms=low_ms,
+        wait_ms_max=high_ms,
+    )
+    await human_delay(low_ms, high_ms)
+
+
+async def _persist_captcha_failure_artifacts(
+    page: Page,
+    config: SRIConfig,
+    *,
+    target_date: date,
+    tipo_label: str,
+) -> None:
+    try:
+        artifacts = await _persist_page_artifacts(
+            page,
+            config,
+            target_date,
+            tipo_label,
+            stage="captcha_failed",
+            classification="captcha_failed_after_consultar",
+        )
+        log.warning("consultar_captcha_artifacts_saved", **artifacts)
+    except Exception as exc:
+        log.warning("consultar_captcha_artifacts_failed", error=str(exc))
+
+
+async def _click_consultar(
+    page: Page,
+    config: SRIConfig,
+    *,
+    target_date: date,
+    tipo_label: str,
+) -> None:
     """
     Hace click en el botón "Consultar" del portal de comprobantes.
 
@@ -449,24 +1016,17 @@ async def _click_consultar(page: Page, config: SRIConfig) -> None:
     Estrategia 2 (fallback sin solver):
       - Humanización + click normal
       - 3 reintentos con delays crecientes
-      - Si sigue fallando, deja que _is_empty_result() lo detecte
+      - Si sigue fallando, aborta la consulta para no tratar CAPTCHA como vacío
 
     Raises:
         DownloadError: Si el botón no se encuentra.
     """
+    log.info("consultar_filters_before_click", current=await _read_current_filters(page))
     await _humanize_before_consultar(page, config)
 
-    # ── Estrategia 1: 2captcha solver ─────────────────────────────────────────
-    if config.twocaptcha_api_key:
-        token = await _solve_recaptcha_2captcha(page.url, config.twocaptcha_api_key)
-        if token:
-            await _inject_and_submit_with_token(page, token)
-            log.info("consultar_via_2captcha")
-            return
-        else:
-            log.warning("2captcha_failed_falling_back_to_click")
+    # En modo headed preferimos primero el flujo natural del navegador real.
+    prefer_natural = not config.headless
 
-    # ── Estrategia 2: click normal con reintentos ──────────────────────────────
     selectors = [
         "button:has-text('Consultar')",
         "input[value='Consultar']",
@@ -498,7 +1058,62 @@ async def _click_consultar(page: Page, config: SRIConfig) -> None:
         "[class*='alert']:has-text('captcha')",
     ]
 
-    # Hasta 3 intentos con delays crecientes
+    async def _natural_click_attempts(max_attempts: int) -> bool:
+        for attempt in range(max_attempts):
+            try:
+                await consultar_btn.hover()
+                await human_delay(250, 700)
+            except Exception:
+                pass
+
+            await consultar_btn.click()
+            log.debug("consultar_btn_clicked", attempt=attempt + 1)
+            await human_delay(5000, 8000)
+
+            captcha_failed = False
+            for sel in captcha_error_selectors:
+                try:
+                    el = page.locator(sel).first
+                    if await el.is_visible(timeout=2_000):
+                        captcha_failed = True
+                        log.warning("captcha_failed_retrying", selector=sel, attempt=attempt + 1)
+                        break
+                except PlaywrightTimeoutError:
+                    continue
+
+            if not captcha_failed:
+                log.info("consultar_clicked_naturally", attempt=attempt + 1)
+                return True
+
+            if attempt < max_attempts - 1:
+                await _humanize_after_captcha_failure(page, config, attempt=attempt)
+        return False
+
+    if prefer_natural:
+        if await _natural_click_attempts(3):
+            return
+        # En modo headed preferimos cortar aquí antes que caer a una segunda
+        # ronda de clicks más mecánicos que delatan automatización.
+        if not config.twocaptcha_api_key:
+            await _persist_captcha_failure_artifacts(
+                page,
+                config,
+                target_date=target_date,
+                tipo_label=tipo_label,
+            )
+            log.warning("consultar_captcha_exhausted_retries")
+            raise CaptchaChallengeError("Captcha incorrecta persistente al consultar el SRI")
+
+    # ── Estrategia 2: 2captcha solver ────────────────────────────────────────
+    if config.twocaptcha_api_key:
+        token = await _solve_recaptcha_2captcha(page.url, config.twocaptcha_api_key)
+        if token:
+            await _inject_and_submit_with_token(page, token)
+            log.info("consultar_via_2captcha")
+            return
+        log.warning("2captcha_failed_falling_back_to_click")
+
+    # ── Estrategia 3: click normal con reintentos ─────────────────────────────
     for attempt in range(3):
         await consultar_btn.click()
         log.debug("consultar_btn_clicked", attempt=attempt + 1)
@@ -520,15 +1135,16 @@ async def _click_consultar(page: Page, config: SRIConfig) -> None:
             return  # Éxito
 
         if attempt < 2:
-            wait_ms = (attempt + 1) * 10_000
-            log.info("consultar_retry_after_captcha", wait_ms=wait_ms)
-            await human_delay(wait_ms, wait_ms + 5000)
-            await page.evaluate("window.scrollTo(0, 300)")
-            await human_delay(800, 1500)
-            await page.evaluate("window.scrollTo(0, 0)")
-            await human_delay(500, 1000)
+            await _humanize_after_captcha_failure(page, config, attempt=attempt)
 
+    await _persist_captcha_failure_artifacts(
+        page,
+        config,
+        target_date=target_date,
+        tipo_label=tipo_label,
+    )
     log.warning("consultar_captcha_exhausted_retries")
+    raise CaptchaChallengeError("Captcha incorrecta persistente al consultar el SRI")
 
 
 async def _is_empty_result(page: Page) -> bool:
@@ -538,7 +1154,9 @@ async def _is_empty_result(page: Page) -> bool:
     Retorna True si:
     - El portal muestra texto de "sin resultados"
     - No hay tabla de resultados con filas de datos (RichFaces / tabla JSF)
-    - El CAPTCHA sigue fallando
+
+    Raises:
+        CaptchaChallengeError: Si el portal sigue reportando CAPTCHA incorrecto.
     """
     # ── Verificación robusta via JS (innerText solo incluye texto visible) ───────
     # Usamos JS en lugar de Playwright locators para evitar problemas con
@@ -565,7 +1183,7 @@ async def _is_empty_result(page: Page) -> bool:
     except Exception:
         pass
 
-    # Si el CAPTCHA sigue fallando después del retry, tratar como vacío
+    # Si el CAPTCHA sigue fallando después del retry, abortar.
     captcha_error_selectors = [
         "text=Captcha incorrecta",
         "text=Captcha error",
@@ -574,8 +1192,10 @@ async def _is_empty_result(page: Page) -> bool:
         try:
             el = page.locator(sel).first
             if await el.is_visible(timeout=1_000):
-                log.warning("captcha_still_failing_treating_as_empty")
-                return True
+                log.warning("captcha_still_failing_after_consultar", selector=sel)
+                raise CaptchaChallengeError(
+                    "Captcha incorrecta persistente luego de consultar el SRI"
+                )
         except PlaywrightTimeoutError:
             continue
 
@@ -616,12 +1236,97 @@ async def _is_empty_result(page: Page) -> bool:
     return False
 
 
+async def _persist_page_artifacts(
+    page: Page,
+    config: SRIConfig,
+    target_date: date,
+    tipo_label: str,
+    stage: str,
+    classification: str,
+    extra: Optional[dict] = None,
+) -> dict[str, str]:
+    """Guarda screenshot, HTML, innerText y metadata clasificando el estado actual."""
+    stem = artifact_stem(target_date, tipo_label, stage)
+    screenshot_path = config.logs_dir / f"{stem}.png"
+    html_path = config.logs_dir / f"{stem}.html"
+    text_path = config.logs_dir / f"{stem}_innerText.txt"
+    meta_path = config.logs_dir / f"{stem}.json"
+
+    await page.screenshot(path=str(screenshot_path), full_page=True)
+    html = await page.content()
+    inner_text = await page.evaluate("() => document.body.innerText")
+    filters = await _read_current_filters(page)
+
+    write_text_artifact(html_path, html)
+    write_text_artifact(text_path, inner_text)
+    write_json_artifact(
+        meta_path,
+        {
+            "classification": classification,
+            "stage": stage,
+            "tipo_label": tipo_label,
+            "target_date": str(target_date),
+            "page_url": page.url,
+            "artifacts": {
+                "screenshot": str(screenshot_path),
+                "html": str(html_path),
+                "inner_text": str(text_path),
+            },
+            "filters": filters,
+            **(extra or {}),
+        },
+    )
+    return {
+        "screenshot": str(screenshot_path),
+        "html": str(html_path),
+        "inner_text": str(text_path),
+        "metadata": str(meta_path),
+    }
+
+
+def _persist_jsf_debug_artifacts(
+    config: SRIConfig,
+    target_date: date,
+    tipo_label: str,
+    responses: list[dict],
+) -> list[str]:
+    stem = artifact_stem(target_date, tipo_label, "jsf_route")
+    meta_path = config.logs_dir / f"{stem}.json"
+    saved_files: list[str] = []
+    serializable: list[dict] = []
+
+    for idx, entry in enumerate(responses, start=1):
+        entry_copy = {k: v for k, v in entry.items() if k != "body"}
+        body: bytes = entry["body"]
+        suffix = ".txt"
+        if entry["classification"] == "html":
+            suffix = ".html"
+        elif entry["classification"] == "binary":
+            suffix = ".bin"
+        artifact_path = config.logs_dir / f"{stem}_{idx:02d}{suffix}"
+        persist_binary_artifact(artifact_path, body)
+        entry_copy["artifact_path"] = str(artifact_path)
+        serializable.append(entry_copy)
+        saved_files.append(str(artifact_path))
+
+    write_json_artifact(meta_path, {"responses": serializable})
+    saved_files.append(str(meta_path))
+    return saved_files
+
+
 _CLAVE_RE = re.compile(r"(?<!\d)(\d{49})(?!\d)")
 
 # Regex para 49-digit access keys used in DOM scraping strategy
 
 
-async def _extract_claves_from_dom(page: Page, dest: Path) -> Optional[Path]:
+async def _extract_claves_from_dom(
+    page: Page,
+    config: SRIConfig,
+    target_date: date,
+    tipo_label: str,
+    dest: Path,
+    stage: str,
+) -> Optional[Path]:
     """
     Extrae claves de acceso (49 dígitos) directamente del DOM de la página.
 
@@ -673,29 +1378,29 @@ async def _extract_claves_from_dom(page: Page, dest: Path) -> Optional[Path]:
             return dest
 
         log.info("dom_extraction_no_claves_in_page")
-
-        # ── Diagnóstico: guardar HTML completo y estadísticas para entender
-        # por qué no se encontraron claves (solo en primera llamada = no en loop).
-        # El archivo se llama debug_dom_<tipo_slug>.html en logs_dir.
-        try:
-            debug_path = dest.parent.parent / "logs" / f"debug_dom_{dest.stem}.html"
-            # Guardar máx 200KB para no saturar disco
-            debug_path.write_text(content[:200_000], encoding="utf-8", errors="replace")
-            # Buscar secuencias de dígitos largas (>10) para ver si hay claves parciales
-            import re as _re
-            long_digits = _re.findall(r"\d{10,}", content)
-            # Contar cuántos tiene la tabla innerText
-            table_digits = _re.findall(r"\d{10,}", table_text)
-            log.debug(
-                "dom_debug_info",
-                html_size=len(content),
-                long_digit_seqs_html=len(long_digits),
-                long_digit_seqs_table=len(table_digits),
-                sample_long=long_digits[:3] if long_digits else [],
-                debug_html=str(debug_path),
-            )
-        except Exception:
-            pass
+        long_digits = re.findall(r"\d{10,}", content)
+        table_digits = re.findall(r"\d{10,}", table_text)
+        await _persist_page_artifacts(
+            page,
+            config,
+            target_date,
+            tipo_label,
+            stage=stage,
+            classification="dom_missing_claves",
+            extra={
+                "html_size": len(content),
+                "long_digit_seqs_html": len(long_digits),
+                "long_digit_seqs_table": len(table_digits),
+                "sample_long": long_digits[:3],
+            },
+        )
+        log.debug(
+            "dom_debug_info",
+            html_size=len(content),
+            long_digit_seqs_html=len(long_digits),
+            long_digit_seqs_table=len(table_digits),
+            sample_long=long_digits[:3] if long_digits else [],
+        )
 
         return None
 
@@ -707,6 +1412,8 @@ async def _extract_claves_from_dom(page: Page, dest: Path) -> Optional[Path]:
 async def _do_download(
     page: Page,
     config: SRIConfig,
+    target_date: date,
+    tipo_label: str,
     dest: Path,
 ) -> Optional[Path]:
     """
@@ -729,7 +1436,14 @@ async def _do_download(
         DownloadError: Si todas las estrategias fallan.
     """
     # ── Estrategia 0: DOM scraping (no requiere click) ───────────────────────────
-    dom_result = await _extract_claves_from_dom(page, dest)
+    dom_result = await _extract_claves_from_dom(
+        page,
+        config,
+        target_date,
+        tipo_label,
+        dest,
+        stage="dom_probe_00",
+    )
     if dom_result is not None:
         return dom_result
 
@@ -740,11 +1454,27 @@ async def _do_download(
     for _wait_round in range(5):
         await page.wait_for_timeout(3_000)
         # Intentar extracción de nuevo (puede aparecer la tabla con retraso)
-        dom_result = await _extract_claves_from_dom(page, dest)
+        dom_result = await _extract_claves_from_dom(
+            page,
+            config,
+            target_date,
+            tipo_label,
+            dest,
+            stage=f"dom_probe_{_wait_round + 1:02d}",
+        )
         if dom_result is not None:
             return dom_result
         # Si el portal ya muestra mensaje visible de "sin datos" → salir limpio
         if await _is_empty_result(page):
+            await _persist_page_artifacts(
+                page,
+                config,
+                target_date,
+                tipo_label,
+                stage=f"empty_after_wait_{_wait_round + 1:02d}",
+                classification="empty_result_detected_after_ajax_wait",
+                extra={"wait_round": _wait_round + 1},
+            )
             log.info("download_empty_confirmed_after_ajax_wait", round=_wait_round + 1)
             return None
 
@@ -753,6 +1483,14 @@ async def _do_download(
     # hasta 25s en aparecer — si se detecta ahora evitamos los ~60s de botón.
     await page.wait_for_timeout(8_000)
     if await _is_empty_result(page):
+        await _persist_page_artifacts(
+            page,
+            config,
+            target_date,
+            tipo_label,
+            stage="empty_pre_button",
+            classification="empty_result_detected_pre_button",
+        )
         log.info("download_empty_confirmed_pre_button")
         return None
 
@@ -783,11 +1521,17 @@ async def _do_download(
             continue
 
     if download_btn is None:
-        screenshot_path = str(config.logs_dir / "download_debug_btn.png")
-        await page.screenshot(path=screenshot_path)
+        artifacts = await _persist_page_artifacts(
+            page,
+            config,
+            target_date,
+            tipo_label,
+            stage="missing_download_button",
+            classification="download_button_not_found",
+        )
         raise DownloadError(
             f"No se encontró el botón 'Descargar reporte'. "
-            f"Screenshot: {screenshot_path}"
+            f"Screenshot: {artifacts['screenshot']}"
         )
 
     # Loguear atributos del botón para diagnóstico
@@ -969,6 +1713,7 @@ async def _do_download(
             cd = response.headers.get("content-disposition", "")
             body = await response.body()
             preview = body[:120].decode("utf-8", errors="replace") if body else ""
+            classification = classify_payload(ct, cd, preview)
             jsf_debug.append({
                 "method": request.method,
                 "url": request.url[-80:],
@@ -977,6 +1722,8 @@ async def _do_download(
                 "cd": cd[:60],
                 "size": len(body),
                 "preview": preview[:80],
+                "classification": classification,
+                "body": body,
             })
             # Capturar si es el archivo real: adjunto, o texto plano no-JSON >100 bytes
             # NOTA: NO chequeamos "No existen datos" en el HTML porque esa cadena
@@ -1001,7 +1748,11 @@ async def _do_download(
             pass
 
     for entry in jsf_debug:
-        log.debug("jsf_route_response", **entry)
+        log.debug("jsf_route_response", **{k: v for k, v in entry.items() if k != "body"})
+
+    if jsf_debug:
+        artifact_paths = _persist_jsf_debug_artifacts(config, target_date, tipo_label, jsf_debug)
+        log.info("jsf_route_artifacts_saved", tipo=tipo_label, files=artifact_paths)
 
     if jsf_bodies:
         body_to_use = jsf_bodies[-1]
@@ -1053,11 +1804,17 @@ async def _do_download(
     # consultada (el portal no muestra mensaje visible cuando el AJAX devuelve
     # 0 resultados para un tipo específico).
     # Retornar None permite que el bucle de tipos continúe con el siguiente.
-    screenshot_path = str(config.logs_dir / "download_timeout.png")
-    await page.screenshot(path=screenshot_path, full_page=True)
+    artifacts = await _persist_page_artifacts(
+        page,
+        config,
+        target_date,
+        tipo_label,
+        stage="download_all_failed",
+        classification="download_all_strategies_failed",
+    )
     log.warning(
         "download_all_strategies_failed",
         note="tratando como tipo sin comprobantes para esta fecha",
-        screenshot=screenshot_path,
+        screenshot=artifacts["screenshot"],
     )
     return None

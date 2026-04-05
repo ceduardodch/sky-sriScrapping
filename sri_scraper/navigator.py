@@ -32,7 +32,12 @@ COMPROBANTES_RECIBIDOS_PATH = "comprobantes-electronicos-internet"
 TUPORTAL_RECIBIDOS_PARAM = "redireccion=57"
 
 
-async def go_to_comprobantes_recibidos(page: Page, timeout_ms: int) -> None:
+async def go_to_comprobantes_recibidos(
+    page: Page,
+    timeout_ms: int,
+    *,
+    prefer_menu_first: bool = False,
+) -> None:
     """
     Navega desde el dashboard a Comprobantes electrónicos recibidos.
 
@@ -54,11 +59,22 @@ async def go_to_comprobantes_recibidos(page: Page, timeout_ms: int) -> None:
         log.info("navigation_skipped", reason="already_in_section")
         return
 
+    if prefer_menu_first:
+        log.info("navigation_menu_first_enabled")
+        try:
+            await _wait_for_portal_ready(page, timeout_ms)
+            await human_delay(1200, 2400)
+            await _navigate_via_menu(page, timeout_ms)
+            log.info("navigation_success", url=page.url, strategy="menu_first")
+            return
+        except Exception as e:
+            log.warning("navigation_menu_first_failed", error=str(e), url=page.url)
+
     # Estrategia 1: Navegación directa (portal nuevo — redirige correctamente)
     try:
         log.info("navigation_direct_goto", url=TUPORTAL_RECIBIDOS_URL)
         await page.goto(TUPORTAL_RECIBIDOS_URL, wait_until="domcontentloaded", timeout=timeout_ms)
-        await human_delay(800, 1500)
+        await human_delay(1200, 2400)
 
         if COMPROBANTES_RECIBIDOS_PATH in page.url:
             log.info("navigation_success", url=page.url)
@@ -75,7 +91,7 @@ async def go_to_comprobantes_recibidos(page: Page, timeout_ms: int) -> None:
     # Estrategia 2: Via menú (portal con sidebar)
     log.info("navigation_via_menu_fallback")
     await _wait_for_portal_ready(page, timeout_ms)
-    await human_delay(800, 1500)
+    await human_delay(1200, 2400)
     await _navigate_via_menu(page, timeout_ms)
     log.info("navigation_success", url=page.url)
 

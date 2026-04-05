@@ -1,24 +1,26 @@
 """
 Endpoints para:
-  - POST /api/v1/comprobantes       (worker interno)
-  - GET  /api/v1/comprobantes       (clientes)
+  - POST /api/v1/comprobantes         (worker interno)
+  - GET  /api/v1/comprobantes         (clientes)
   - GET  /api/v1/comprobantes/{clave} (clientes)
 """
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth import verify_admin, verify_tenant
-from ..database import get_session
+from ..database import data_session_context, get_control_session
 from ..models import Comprobante, Tenant
 from ..schemas import (
-    ComprobantePush,
     ComprobanteOut,
+    ComprobantePush,
     ComprobantesListOut,
+    ErrorResponse,
     EmisorOut,
     ReceptorOut,
     TotalesOut,
@@ -27,8 +29,6 @@ from ..xml_parser import parse_xml
 
 router = APIRouter(prefix="/api/v1", tags=["comprobantes"])
 
-
-# ── Conversión ORM → schema ────────────────────────────────────────────────────
 
 def _to_out(c: Comprobante) -> ComprobanteOut:
     serie = (
@@ -64,56 +64,25 @@ def _to_out(c: Comprobante) -> ComprobanteOut:
     )
 
 
-# ── Worker → API: recibir XML ──────────────────────────────────────────────────
-
-@router.post(
-    "/comprobantes",
-    status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(verify_admin)],
-    summary="[Interno] Recibir XML del worker",
-    include_in_schema=True,
-)
-async def push_comprobante(
-    body: ComprobantePush,
-    session: AsyncSession = Depends(get_session),
-) -> dict:
-    # Parsear XML
+def _parse_fecha_autorizacion(value: str | None) -> datetime | None:
+    if not value:
+        return None
     try:
-        parsed = parse_xml(body.xml_comprobante)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"XML inválido: {e}")
+        from dateutil.parser import parse as _parse
 
-    # Parsear fecha_autorizacion
-    fecha_auth: datetime | None = None
-    if body.fecha_autorizacion:
-        try:
-            from dateutil.parser import parse as _parse
-            fecha_auth = _parse(body.fecha_autorizacion)
-            if fecha_auth.tzinfo is None:
-                fecha_auth = fecha_auth.replace(tzinfo=timezone.utc)
-        except Exception:
-            pass
+        parsed = _parse(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except Exception:
+        return None
 
-    # Upsert (INSERT ... ON CONFLICT DO NOTHING + update)
-    existing = await session.execute(
-        select(Comprobante).where(
-            Comprobante.tenant_id == body.tenant_id,
-            Comprobante.clave_acceso == body.clave_acceso,
-        )
-    )
-    comp = existing.scalar_one_or_none()
 
-    if comp is None:
-        comp = Comprobante(
-            tenant_id=body.tenant_id,
-            clave_acceso=body.clave_acceso,
-        )
-        session.add(comp)
-
+def _populate_comprobante(comp: Comprobante, body: ComprobantePush, parsed: dict) -> None:
     comp.numero_autorizacion = body.numero_autorizacion or None
     comp.estado = body.estado
     comp.ambiente = body.ambiente
-    comp.fecha_autorizacion = fecha_auth
+    comp.fecha_autorizacion = _parse_fecha_autorizacion(body.fecha_autorizacion)
     comp.xml_raw = body.xml_comprobante
     comp.tipo_comprobante = parsed["tipo_comprobante"]
     comp.cod_doc = parsed["cod_doc"]
@@ -131,16 +100,105 @@ async def push_comprobante(
     comp.importe_total = parsed["importe_total"]
     comp.detalles = parsed["detalles"] or []
 
-    await session.commit()
-    return {"ok": True, "clave_acceso": body.clave_acceso}
+
+async def _find_existing_comprobante(
+    session: AsyncSession,
+    *,
+    tenant_id: int,
+    clave_acceso: str,
+) -> Comprobante | None:
+    result = await session.execute(
+        select(Comprobante).where(
+            Comprobante.tenant_id == tenant_id,
+            Comprobante.clave_acceso == clave_acceso,
+        )
+    )
+    return result.scalar_one_or_none()
 
 
-# ── Clientes: GET comprobantes ─────────────────────────────────────────────────
+_TENANT_ERRORS = {
+    403: {"model": ErrorResponse, "description": "API key de tenant inválida o inactiva"},
+    422: {"model": ErrorResponse, "description": "Parámetros inválidos"},
+}
+
+
+@router.post(
+    "/comprobantes",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(verify_admin)],
+    summary="[Interno] Recibir XML del worker",
+    description="Inserta o actualiza un comprobante en el data store del cliente.",
+    responses={
+        200: {"description": "Comprobante ya existente — actualizado"},
+        404: {"model": ErrorResponse, "description": "Tenant no encontrado"},
+        422: {"model": ErrorResponse, "description": "XML inválido o parámetros incorrectos"},
+        403: {"model": ErrorResponse, "description": "API key admin inválida"},
+    },
+)
+async def push_comprobante(
+    body: ComprobantePush,
+    response: Response,
+    control_session: AsyncSession = Depends(get_control_session),
+) -> dict:
+    try:
+        parsed = parse_xml(body.xml_comprobante)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"XML inválido: {e}")
+
+    tenant = await control_session.get(Tenant, body.tenant_id)
+    if tenant is None:
+        raise HTTPException(status_code=404, detail="Tenant no encontrado")
+
+    async with data_session_context(tenant.storage_key) as data_session:
+        comp = await _find_existing_comprobante(
+            data_session,
+            tenant_id=body.tenant_id,
+            clave_acceso=body.clave_acceso,
+        )
+        created = comp is None
+
+        if comp is None:
+            comp = Comprobante(
+                tenant_id=body.tenant_id,
+                clave_acceso=body.clave_acceso,
+            )
+            data_session.add(comp)
+
+        _populate_comprobante(comp, body, parsed)
+        try:
+            await data_session.commit()
+        except IntegrityError:
+            # Si dos procesos intentan insertar la misma clave al mismo tiempo,
+            # la restricción única gana. Releemos y actualizamos el registro.
+            await data_session.rollback()
+            comp = await _find_existing_comprobante(
+                data_session,
+                tenant_id=body.tenant_id,
+                clave_acceso=body.clave_acceso,
+            )
+            if comp is None:
+                raise
+            created = False
+            _populate_comprobante(comp, body, parsed)
+            await data_session.commit()
+
+    response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    return {"ok": True, "created": created, "clave_acceso": body.clave_acceso}
+
 
 @router.get(
     "/comprobantes",
     response_model=ComprobantesListOut,
-    summary="Listar comprobantes del tenant autenticado",
+    summary="Listar comprobantes del cliente autenticado",
+    responses={**_TENANT_ERRORS},
+    description=(
+        "Consulta solo los comprobantes del tenant asociado a la API key enviada.\n\n"
+        "Ejemplo:\n"
+        "```bash\n"
+        "curl 'http://127.0.0.1:8000/api/v1/comprobantes?fecha_desde=2026-03-23&limit=20' \\\n"
+        "  -H 'X-API-Key: <TENANT_API_KEY>'\n"
+        "```"
+    ),
 )
 async def list_comprobantes(
     fecha_desde: date | None = Query(None),
@@ -150,24 +208,24 @@ async def list_comprobantes(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     tenant: Tenant = Depends(verify_tenant),
-    session: AsyncSession = Depends(get_session),
 ) -> ComprobantesListOut:
-    q = select(Comprobante).where(Comprobante.tenant_id == tenant.id)
+    async with data_session_context(tenant.storage_key) as session:
+        q = select(Comprobante).where(Comprobante.tenant_id == tenant.id)
 
-    if fecha_desde:
-        q = q.where(Comprobante.fecha_emision >= fecha_desde)
-    if fecha_hasta:
-        q = q.where(Comprobante.fecha_emision <= fecha_hasta)
-    if tipo:
-        q = q.where(Comprobante.tipo_comprobante == tipo)
-    if ruc_emisor:
-        q = q.where(Comprobante.ruc_emisor == ruc_emisor)
+        if fecha_desde:
+            q = q.where(Comprobante.fecha_emision >= fecha_desde)
+        if fecha_hasta:
+            q = q.where(Comprobante.fecha_emision <= fecha_hasta)
+        if tipo:
+            q = q.where(Comprobante.tipo_comprobante == tipo)
+        if ruc_emisor:
+            q = q.where(Comprobante.ruc_emisor == ruc_emisor)
 
-    count_q = select(func.count()).select_from(q.subquery())
-    total = (await session.execute(count_q)).scalar_one()
+        count_q = select(func.count()).select_from(q.subquery())
+        total = (await session.execute(count_q)).scalar_one()
 
-    items_q = q.order_by(Comprobante.fecha_emision.desc()).offset(offset).limit(limit)
-    items = (await session.execute(items_q)).scalars().all()
+        items_q = q.order_by(Comprobante.fecha_emision.desc()).offset(offset).limit(limit)
+        items = (await session.execute(items_q)).scalars().all()
 
     return ComprobantesListOut(
         total=total,
@@ -181,19 +239,24 @@ async def list_comprobantes(
     "/comprobantes/{clave_acceso}",
     response_model=ComprobanteOut,
     summary="Obtener comprobante por clave de acceso",
+    responses={
+        404: {"model": ErrorResponse, "description": "Comprobante no encontrado"},
+        **_TENANT_ERRORS,
+    },
 )
 async def get_comprobante(
     clave_acceso: str,
     tenant: Tenant = Depends(verify_tenant),
-    session: AsyncSession = Depends(get_session),
 ) -> ComprobanteOut:
-    result = await session.execute(
-        select(Comprobante).where(
-            Comprobante.tenant_id == tenant.id,
-            Comprobante.clave_acceso == clave_acceso,
+    async with data_session_context(tenant.storage_key) as session:
+        result = await session.execute(
+            select(Comprobante).where(
+                Comprobante.tenant_id == tenant.id,
+                Comprobante.clave_acceso == clave_acceso,
+            )
         )
-    )
-    comp = result.scalar_one_or_none()
+        comp = result.scalar_one_or_none()
+
     if not comp:
         raise HTTPException(status_code=404, detail="Comprobante no encontrado")
     return _to_out(comp)

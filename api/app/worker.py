@@ -15,17 +15,62 @@ se usa run_scrape_for_tenant().
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
-import sys
-import os
-from datetime import date, datetime, timezone
-from pathlib import Path
+from datetime import datetime, timezone
+from typing import Iterable, List
 
 import structlog
+from apscheduler.triggers.cron import CronTrigger
 
 log = structlog.get_logger(__name__)
 
 # ── Pipeline del scraper ───────────────────────────────────────────────────────
+
+
+def _extract_clave_value(clave_info) -> str:
+    """
+    Normaliza una clave parseada para la fase SOAP.
+
+    `extract_claves_from_file()` retorna instancias de `ClaveDeAcceso`, pero en
+    algunos flujos antiguos también se manejaron dicts serializados. Si aquí
+    usamos `str(clave_info)` sobre el dataclass, terminamos enviando al SOAP el
+    repr completo del objeto en vez de los 49 dígitos de la clave.
+    """
+    if isinstance(clave_info, dict):
+        return str(clave_info["clave"])
+
+    raw_value = getattr(clave_info, "raw", None)
+    if raw_value:
+        return str(raw_value)
+
+    return str(clave_info)
+
+
+def _dedupe_claves(claves: Iterable[object]) -> List[object]:
+    """Elimina claves repetidas dentro de una misma corrida conservando el orden."""
+    uniques: List[object] = []
+    seen: set[str] = set()
+
+    for clave_info in claves:
+        clave = _extract_clave_value(clave_info)
+        if clave in seen:
+            continue
+        seen.add(clave)
+        uniques.append(clave_info)
+
+    return uniques
+
+
+def _build_scrape_trigger(*, hour: int, minute: int, tz) -> CronTrigger:
+    """
+    Construye el cron del worker con zona horaria explícita.
+
+    En algunos hosts Linux, `CronTrigger(hour=1, minute=0)` sin `timezone`
+    termina interpretándose en UTC aunque el scheduler viva en
+    `America/Guayaquil`, disparando a las 20:00 hora Ecuador del día previo.
+    """
+    return CronTrigger(hour=hour, minute=minute, timezone=tz)
 
 async def run_scrape_for_tenant(tenant_id: int, log_id: int) -> None:
     """
@@ -37,12 +82,12 @@ async def run_scrape_for_tenant(tenant_id: int, log_id: int) -> None:
 
     Actualiza scrape_logs al terminar.
     """
-    from .database import AsyncSessionLocal
+    from .database import control_session_context
     from .models import ScrapeLog, Tenant
     from .crypto import decrypt
     from .config import settings
 
-    async with AsyncSessionLocal() as session:
+    async with control_session_context() as session:
         tenant = await session.get(Tenant, tenant_id)
         if not tenant:
             log.error("worker_tenant_not_found", tenant_id=tenant_id)
@@ -70,7 +115,7 @@ async def run_scrape_for_tenant(tenant_id: int, log_id: int) -> None:
         status = "failed"
 
     # Actualizar log
-    async with AsyncSessionLocal() as session:
+    async with control_session_context() as session:
         scrape_log = await session.get(ScrapeLog, log_id)
         if scrape_log:
             scrape_log.status = status
@@ -93,47 +138,44 @@ async def _scrape_pipeline(
     """
     Pipeline scraper → API. Retorna la cantidad de comprobantes nuevos.
 
-    Importa sri_scraper que debe estar en el PYTHONPATH del worker.
+    Usa la configuración nativa del host o los defaults de Docker según el entorno.
     """
-    # sri_scraper debe estar en el path (ver Dockerfile.worker)
-    sys.path.insert(0, "/app")
-
+    from .config import settings
     from sri_scraper.config import SRIConfig
-    from sri_scraper.browser import browser_context
-    from sri_scraper.login import login
-    from sri_scraper.navigator import go_to_comprobantes_recibidos
-    from sri_scraper.downloader import download_report
-    from sri_scraper.parser import extract_claves_from_file
+    from sri_scraper.pipeline import scrape_recibidos
     from sri_scraper.soap_client import SRISOAPClient
 
-    target_date = date.today()  # descarga el día de ayer (config lo maneja)
+    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    tenant_root = settings.worker_runtime_root / f"tenant_{tenant_id}"
 
     config = SRIConfig(
         sri_ruc=ruc,
         sri_password=sri_password,
-        headless=True,
-        browser_channel="",   # Chromium bundled (en Docker)
-        downloads_dir=Path(f"/tmp/sri_{tenant_id}_{target_date}"),
-        state_dir=Path(f"/tmp/sri_state_{tenant_id}"),
-        logs_dir=Path(f"/tmp/sri_logs_{tenant_id}"),
+        headless=settings.headless,
+        browser_channel=settings.browser_channel,
+        browser_executable_path=settings.browser_executable_path,
+        downloads_dir=tenant_root / "downloads" / run_stamp,
+        state_dir=tenant_root / "state",
+        logs_dir=tenant_root / "logs" / run_stamp,
     )
     config.ensure_dirs()
+    target_date = config.effective_report_date
 
-    # ── Fase 1: Browser → TXT ──────────────────────────────────────────────────
-    txt_path: Path | None = None
-    async with browser_context(config) as ctx:
-        page = await login(ctx, config)
-        await go_to_comprobantes_recibidos(page, config.page_timeout_ms)
-        txt_path = await download_report(page, config)
-
-    if txt_path is None:
+    scrape_result = await scrape_recibidos(config)
+    if scrape_result.txt_path is None:
         log.info("worker_no_comprobantes", tenant_id=tenant_id, date=str(target_date))
         return 0
 
-    # ── Fase 2: Parse claves ───────────────────────────────────────────────────
-    claves = extract_claves_from_file(txt_path)
+    claves = _dedupe_claves(scrape_result.claves)
     if not claves:
         return 0
+    if len(claves) != len(scrape_result.claves):
+        log.info(
+            "worker_claves_deduplicated",
+            tenant_id=tenant_id,
+            before=len(scrape_result.claves),
+            after=len(claves),
+        )
 
     # ── Fase 3: SOAP + push a API ──────────────────────────────────────────────
     import httpx
@@ -143,7 +185,7 @@ async def _scrape_pipeline(
 
     async with httpx.AsyncClient(base_url=api_url, timeout=30) as client:
         for clave_info in claves:
-            clave = clave_info["clave"] if isinstance(clave_info, dict) else str(clave_info)
+            clave = _extract_clave_value(clave_info)
             result = soap.autorizar_comprobante(clave)
 
             if not result.tiene_xml:
@@ -165,12 +207,28 @@ async def _scrape_pipeline(
             )
             if resp.status_code == 201:
                 nuevos += 1
-            elif resp.status_code == 409:
-                pass  # ya existía
+            elif resp.status_code in (200, 409):
+                pass
             else:
                 log.warning("worker_push_failed", clave=clave, status=resp.status_code)
 
     return nuevos
+
+
+async def _run_once(tenant_id: int) -> None:
+    """Ejecuta un scrape inmediato para un tenant sin iniciar el scheduler."""
+    from .database import control_session_context
+    from .models import ScrapeLog
+
+    async with control_session_context() as session:
+        scrape_log = ScrapeLog(tenant_id=tenant_id, status="running")
+        session.add(scrape_log)
+        await session.commit()
+        await session.refresh(scrape_log)
+        log_id = scrape_log.id
+
+    log.info("worker_manual_run_started", tenant_id=tenant_id, log_id=log_id)
+    await run_scrape_for_tenant(tenant_id, log_id)
 
 
 # ── APScheduler (solo activo cuando el proceso es el worker) ──────────────────
@@ -182,7 +240,6 @@ def start_scheduler() -> None:
     """
     import asyncio
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
-    from apscheduler.triggers.cron import CronTrigger
 
     async def _main() -> None:
         import pytz
@@ -191,10 +248,10 @@ def start_scheduler() -> None:
 
         async def run_pending_scrapes() -> None:
             """Ejecuta inmediatamente cualquier ScrapeLog con status='pending'."""
-            from .database import AsyncSessionLocal
+            from .database import control_session_context
             from .models import ScrapeLog
             from sqlalchemy import select
-            async with AsyncSessionLocal() as session:
+            async with control_session_context() as session:
                 pending = (await session.execute(
                     select(ScrapeLog).where(ScrapeLog.status == "pending")
                 )).scalars().all()
@@ -207,11 +264,11 @@ def start_scheduler() -> None:
 
         async def schedule_tenants() -> None:
             """Reagenda jobs al inicio y cada 6 horas para detectar nuevos tenants."""
-            from .database import AsyncSessionLocal
+            from .database import control_session_context
             from .models import Tenant
             from sqlalchemy import select
 
-            async with AsyncSessionLocal() as session:
+            async with control_session_context() as session:
                 tenants = (await session.execute(
                     select(Tenant).where(Tenant.active.is_(True)).order_by(Tenant.id)
                 )).scalars().all()
@@ -229,9 +286,9 @@ def start_scheduler() -> None:
                     minute = minute % 60
 
                 async def _run(tid=tenant.id):
-                    from .database import AsyncSessionLocal
+                    from .database import control_session_context
                     from .models import ScrapeLog
-                    async with AsyncSessionLocal() as session:
+                    async with control_session_context() as session:
                         scrape_log = ScrapeLog(tenant_id=tid, status="running")
                         session.add(scrape_log)
                         await session.commit()
@@ -241,7 +298,7 @@ def start_scheduler() -> None:
 
                 scheduler.add_job(
                     _run,
-                    CronTrigger(hour=hour, minute=minute),
+                    _build_scrape_trigger(hour=hour, minute=minute, tz=_tz),
                     id=f"scrape_{tenant.id}",
                     replace_existing=True,
                 )
@@ -261,5 +318,27 @@ def start_scheduler() -> None:
     asyncio.run(_main())
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Worker APScheduler / ejecución manual del scraper.")
+    parser.add_argument("--tenant-id", type=int, help="Tenant a ejecutar manualmente.")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Corre una sola ejecución para el tenant indicado en vez de iniciar el scheduler.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.once:
+        if args.tenant_id is None:
+            parser.error("--once requiere --tenant-id")
+        asyncio.run(_run_once(args.tenant_id))
+        return
+
+    if args.tenant_id is not None:
+        parser.error("--tenant-id solo se puede usar junto con --once")
+
     start_scheduler()
+
+
+if __name__ == "__main__":
+    main()
