@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import sys
-import os
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -180,7 +179,6 @@ def start_scheduler() -> None:
     Inicia APScheduler con un job por tenant, escalonado 20 min entre cada uno.
     Corre de forma bloqueante (event loop propio).
     """
-    import asyncio
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     from apscheduler.triggers.cron import CronTrigger
 

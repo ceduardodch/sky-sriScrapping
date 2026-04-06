@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Optional
 
 import click
-import structlog
 from rich.console import Console
 from rich.table import Table
 
@@ -138,7 +137,7 @@ def cmd_scrape(report_date: Optional[date], headless: bool) -> None:
 
     _configure_logging(config)
 
-    console.print(f"\n[bold blue]SRI Ecuador Scraper — Fase 1[/bold blue]")
+    console.print("\n[bold blue]SRI Ecuador Scraper — Fase 1[/bold blue]")
     console.print(f"RUC: {config.sri_ruc[:4]}***")
     console.print(f"Fecha objetivo: [bold]{config.effective_report_date}[/bold]")
     console.print(f"Modo: {'headless' if config.headless else 'con ventana (headed)'}\n")
@@ -257,7 +256,7 @@ def cmd_download_xml(
     """
     import json
 
-    console.print(f"\n[bold blue]SRI Ecuador — Fase 2: Descarga XML via SOAP[/bold blue]")
+    console.print("\n[bold blue]SRI Ecuador — Fase 2: Descarga XML via SOAP[/bold blue]")
     console.print(f"Fuente:   {json_file}")
     console.print(f"Ambiente: [bold]{ambiente}[/bold]\n")
 
@@ -313,13 +312,13 @@ def cmd_download_xml(
         if result.autorizado and result.tiene_xml:
             if push_to_api:
                 ok_results.append(result)
-                console.print(f"[green]OK[/green] → (pendiente push API)")
+                console.print("[green]OK[/green] → (pendiente push API)")
             else:
                 xml_path = save_xml(result, output_dir)
                 console.print(f"[green]OK[/green] → {xml_path.name if xml_path else '?'}")
             ok += 1
         elif result.estado == "AUTORIZADO" and not result.tiene_xml:
-            console.print(f"[yellow]AUTORIZADO (sin XML)[/yellow]")
+            console.print("[yellow]AUTORIZADO (sin XML)[/yellow]")
             ok += 1
         else:
             msgs = "; ".join(m.get("mensaje", "") for m in result.mensajes) or result.error or ""
@@ -329,7 +328,7 @@ def cmd_download_xml(
     if push_to_api and ok_results:
         console.print(f"\n[cyan]Pusheando {len(ok_results)} XML a la API...[/cyan]")
         asyncio.run(_push_all(ok_results))
-        console.print(f"[green]Push completado[/green]")
+        console.print("[green]Push completado[/green]")
 
     console.print(f"\n[bold]Resumen:[/bold] {ok} OK / {err} con error")
     if ok > 0 and not push_to_api:

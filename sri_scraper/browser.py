@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import random
-import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator

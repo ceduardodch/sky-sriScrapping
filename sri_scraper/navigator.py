@@ -315,12 +315,6 @@ async def _wait_for_tuportal(page: Page, timeout_ms: int) -> bool:
 
     Retorna True si se detecta, False si expira el timeout.
     """
-    # Indicadores de que estamos en tuportal-internet con comprobantes recibidos
-    indicators = [
-        # URL con el parámetro correcto
-        f"**{TUPORTAL_RECIBIDOS_PARAM}**",
-    ]
-
     # Primero verificar por URL (dos patrones posibles según versión del portal)
     url_patterns = [
         f"**{TUPORTAL_RECIBIDOS_PARAM}**",
