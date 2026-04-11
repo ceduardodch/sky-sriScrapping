@@ -2,6 +2,22 @@
 
 Scraper y API para descargar comprobantes recibidos desde el portal del SRI de Ecuador, resolver sus claves de acceso, consultar el XML autorizado por SOAP y almacenarlo en una API multi-tenant con PostgreSQL.
 
+## Flujo del repositorio
+
+Este repositorio usa una política simple y estricta de ramas:
+
+- `develop`: desarrollo
+- `release`: validación y preproducción
+- `main`: producción
+
+Reglas vigentes:
+
+- El trabajo normal debe hacerse en `release`.
+- El flujo preferido es `release -> PR -> main`.
+- `main` queda reservado para producción.
+- Coolify despliega desde `main`.
+- GitHub Actions se usa solo para CI: `lint`, `test`, `build` y checks de PR.
+
 ## Qué hace el proyecto
 
 El flujo completo es:
@@ -17,9 +33,10 @@ El flujo completo es:
 
 - `sri_scraper/`: automatización del navegador, login, navegación, descarga, parseo y SOAP.
 - `api/`: FastAPI, modelos SQLAlchemy, endpoints admin/cliente y worker.
-- `deploy/native/`: scripts y unidades `systemd` para levantar el stack nativo en Linux.
-- `docker-compose.yml`: stack Docker con `db`, `api` y `worker`.
-- `SERVIDOR.md`: apuntes operativos históricos del servidor.
+- `scripts/`: utilidades operativas como backfills y monitoreo manual.
+- `.github/workflows/ci.yml`: CI del repositorio.
+- `DEPLOYMENT.md`: criterio de despliegue y responsabilidades entre Coolify y GitHub Actions.
+- `AGENTS.md`: reglas para asistentes de IA y automatización sobre este repo.
 
 ## Estructura rápida
 
@@ -29,10 +46,10 @@ El flujo completo es:
 │   ├── app/
 │   ├── alembic/
 │   └── requirements.txt
-├── deploy/native/
+├── .github/workflows/
+├── scripts/
 ├── sri_scraper/
 ├── tests/
-├── docker-compose.yml
 ├── run.py
 └── .env.example
 ```
@@ -41,8 +58,7 @@ El flujo completo es:
 
 - Python 3.11 o superior
 - Google Chrome instalado si se usa modo nativo
-- PostgreSQL 16 si se usa modo nativo
-- Docker y Docker Compose si se usa el stack contenedorizado
+- PostgreSQL 16 para desarrollo local si se levanta la API fuera de Coolify
 
 ## Variables de entorno
 
@@ -69,27 +85,6 @@ Variables importantes:
 
 Nota:
 No conviene guardar credenciales reales del servidor, del SRI o llaves de API dentro del repo.
-
-## Arranque rápido con Docker
-
-1. Completar `.env`.
-2. Levantar servicios:
-
-```bash
-docker compose up --build
-```
-
-3. Verificar:
-
-```bash
-curl http://127.0.0.1:8000/health
-```
-
-Servicios esperados:
-
-- API: `http://127.0.0.1:8000`
-- Swagger: `http://127.0.0.1:8000/docs`
-- PostgreSQL: `127.0.0.1:5432`
 
 ## Arranque nativo
 
@@ -120,12 +115,6 @@ Ejecutar worker manual:
 
 ```bash
 python -m api.app.worker --tenant-id 1 --once
-```
-
-En el host nativo `192.168.1.12`, la corrida validada del scraper directo fue:
-
-```bash
-HEADLESS=false xvfb-run -a python run.py scrape --date 2026-03-23
 ```
 
 Ejecutar scheduler:
@@ -188,124 +177,10 @@ DATA_DATABASE_URLS={"default":"postgresql+asyncpg://sri:secret@127.0.0.1:5432/sr
 
 Cada tenant puede apuntar a uno de esos nombres mediante `storage_key`.
 
-## Despliegue nativo en Linux
+## Despliegue y CI
 
-Los scripts de `deploy/native/` preparan un host Ubuntu con Chrome, Xvfb, PostgreSQL, virtualenv y servicios `systemd`.
+- Producción: Coolify despliega desde `main`.
+- GitHub Actions: solo ejecuta CI y validaciones.
+- Este repo no mantiene despliegues por GitHub Actions, SSH, VPS, scripts manuales versionados ni workflows heredados de infraestructura anterior.
 
-Bootstrap inicial:
-
-```bash
-bash deploy/native/bootstrap_native_host.sh
-```
-
-Preparar PostgreSQL nativo y levantar API:
-
-```bash
-bash deploy/native/setup_native_postgres.sh
-```
-
-Unidades instaladas:
-
-- `sky-sri-api.service`
-- `sky-sri-worker.service`
-
-Comandos útiles:
-
-```bash
-systemctl status sky-sri-api.service
-systemctl status sky-sri-worker.service
-curl http://127.0.0.1:18000/health
-```
-
-Importante:
-
-- Si cambias `.env`, reinicia la API nativa para que tome la nueva configuración.
-- El worker nativo se deja deshabilitado a propósito mientras se valida manualmente.
-
-Ejemplo:
-
-```bash
-sudo systemctl restart sky-sri-api.service
-```
-
-## Estado validado en el host `192.168.1.12` el 2026-03-25
-
-Se revisó el servidor y esto es lo confirmado:
-
-- El host responde por red y SSH.
-- El repo activo está en `/home/b2b/apps/sky-sriScrapping`.
-- Los contenedores Docker activos incluyen `sky-sriscrapping-api-1` y `sky-sriscrapping-db-1`.
-- La API nativa en `127.0.0.1:18000` estaba corriendo con configuración vieja de `.env`; tras reiniciarla volvió a reportar `{"status":"ok","db":"ok"}`.
-- El `worker` nativo está deshabilitado, que coincide con la estrategia de validar manualmente.
-- En `scrape_logs` existen ejecuciones recientes exitosas para el tenant `1`.
-- La descarga del TXT sí quedó validada: existe el archivo `runtime/tenant_1/downloads/20260325T132948Z/sri_recibidos_20260323.txt`.
-- Ese TXT contiene 12 claves de acceso y el parser las reconoce como válidas.
-- Una clave de muestra del TXT respondió `AUTORIZADO` en el WS SOAP del SRI y devolvió XML.
-
-Conclusión operativa:
-
-- La parte “login + navegación + descarga TXT + parse + consulta SOAP” quedó comprobada.
-- La parte más sensible hoy es la estabilidad del captcha del portal SRI durante reintentos manuales.
-
-## Observación importante del 2026-03-25
-
-En una corrida manual nueva:
-
-```bash
-HEADLESS=true REPORT_DATE=2026-03-23 python -m api.app.worker --tenant-id 1 --once
-```
-
-el portal empezó a responder `Captcha incorrecta` al reconsultar, aunque ya existía una descarga correcta previa del mismo día en ese mismo host.
-
-Eso sugiere que el problema actual no es “no descarga”, sino la intermitencia del captcha/WAF del SRI.
-
-En cambio, la corrida directa del scraper con:
-
-```bash
-HEADLESS=false xvfb-run -a python run.py scrape --date 2026-03-23
-```
-
-sí descargó `downloads/sri_recibidos_20260323.txt` y generó `downloads/claves_20260323.json`.
-
-## Troubleshooting
-
-### La API nativa devuelve `connection refused` en `/health`
-
-Probable causa:
-la API quedó levantada con un `.env` anterior.
-
-Acción:
-
-```bash
-sudo systemctl restart sky-sri-api.service
-curl http://127.0.0.1:18000/health
-```
-
-### El worker devuelve `Captcha incorrecta`
-
-Probar en este orden:
-
-1. Reintentar con sesión caliente existente en `runtime/.../state/chrome_profile`.
-2. Ejecutar con `HEADLESS=false` solo para depuración visual.
-3. Configurar `TWOCAPTCHA_API_KEY` si se va a automatizar de forma estable.
-
-### Hay descargas pero no se insertan comprobantes
-
-Revisar:
-
-- `INTERNAL_API_URL`
-- salud de `127.0.0.1:18000/health`
-- `ADMIN_API_KEY`
-- tabla `comprobantes`
-- logs del worker
-
-### El servidor se está quedando sin espacio
-
-Durante la validación del 2026-03-25, el host reportó el disco raíz cerca del 95% de uso. Conviene limpiar artefactos viejos en `runtime/` y revisar logs antes de seguir acumulando pruebas.
-
-## Siguientes pasos recomendados
-
-1. Decidir si el staging nativo va a trabajar contra PostgreSQL Docker `:5432` o contra PostgreSQL nativo `:15432`, y dejar `.env` + servicios consistentes con una sola opción.
-2. Agregar manejo operativo del captcha para corridas repetidas.
-3. Limpiar artefactos viejos de `runtime/` para bajar consumo de disco.
-4. Si el objetivo inmediato es validar extremo a extremo, repetir la corrida cuando el captcha esté estable y confirmar inserción en `comprobantes`.
+Consulta [DEPLOYMENT.md](DEPLOYMENT.md) para la regla operativa vigente.

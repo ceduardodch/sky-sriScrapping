@@ -10,7 +10,6 @@ from datetime import date
 from pathlib import Path
 
 from sri_scraper.parser import (
-    ClaveDeAcceso,
     _compute_check_digit,
     extract_claves_from_file,
     extract_claves_from_text,
@@ -53,12 +52,6 @@ class TestModulo11:
 
     def test_check_digit_remainder_zero(self):
         """Cuando remainder == 0, el dígito verificador es 0."""
-        # Construir un caso donde remainder sea 0
-        # Un único dígito = 11: factor[0]=2, 11*2=22, 22%11=0 → check=0
-        base = "0" * 47 + "B"  # no es un dígito, pero probamos la lógica
-        # Mejor: buscar el input que produce remainder=0
-        # 11 * 2 = 22, 22 % 11 = 0 → check digit debe ser 0
-        clave = "0" * 46 + "0" + "b"
         # Test funcional: construir clave y verificar roundtrip
         clave_buena = build_test_clave()
         check = _compute_check_digit(clave_buena[:48])
@@ -163,8 +156,6 @@ class TestParseClave:
 
     def test_fecha_invalida_raises(self):
         # Día 99, mes 99 → fecha inválida
-        clave_mala = "9999" + "2024" + "01" + "1791231480001" + "2" + "001001" + "000000001" + "12345678"
-        # Esto puede tener 49 o no, calcular
         base = "9999202401" + "1791231480001" + "2" + "001001" + "000000001" + "123456789"
         if len(base) == 48:
             base += "0"
