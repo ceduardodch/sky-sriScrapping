@@ -7,12 +7,9 @@ simular las respuestas de zeep y verificar la lógica de parsing y guardado.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from sri_scraper.soap_client import (
     AutorizacionResult,

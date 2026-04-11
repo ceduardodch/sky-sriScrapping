@@ -4,7 +4,7 @@ Requiere X-API-Key: MAESTRA_API_KEY
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Security, status
+from fastapi import APIRouter, Depends, HTTPException, Security
 from fastapi.security import APIKeyHeader
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
